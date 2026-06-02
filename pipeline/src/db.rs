@@ -2,6 +2,7 @@
 
 use crate::models::{BuildStatus, BuilderBackend};
 pub use crate::models::{Batch, Build, BuildFinding};
+use crate::profile::Profile;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -75,30 +76,28 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
 // Batches
 // ---------------------------------------------------------------------------
 
-/// Create a new batch with an auto-generated name.
+/// Create a new batch from a build profile.
 pub async fn create_batch(
     pool: &SqlitePool,
-    clang_version: &str,
-    series: &str,
+    profile: &Profile,
     builder_backend: BuilderBackend,
 ) -> Result<Batch> {
     let id = Uuid::new_v4();
-    let name = format!(
-        "clang-{}-{}-{}",
-        clang_version,
-        series,
-        Utc::now().format("%Y%m%dT%H%M%S")
-    );
+    let name = profile.batch_name();
     let now = Utc::now();
 
     sqlx::query(
-        "INSERT INTO batches (id, name, clang_version, series, builder_backend, started_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO batches (id, name, compiler_type, compiler_version, series,
+                              profile_name, profile_content, builder_backend, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(&name)
-    .bind(clang_version)
-    .bind(series)
+    .bind(profile.compiler.compiler_type.as_str())
+    .bind(&profile.compiler.version)
+    .bind(&profile.target.series)
+    .bind(&profile.name)
+    .bind(&profile.raw_content)
     .bind(builder_backend.as_str())
     .bind(now.to_rfc3339())
     .execute(pool)
@@ -108,8 +107,11 @@ pub async fn create_batch(
     Ok(Batch {
         id,
         name,
-        clang_version: clang_version.to_string(),
-        series: series.to_string(),
+        compiler_type: profile.compiler.compiler_type.as_str().to_string(),
+        compiler_version: profile.compiler.version.clone(),
+        series: profile.target.series.clone(),
+        profile_name: profile.name.clone(),
+        profile_content: profile.raw_content.clone(),
         builder_backend,
         started_at: now,
         finished_at: None,
@@ -129,7 +131,7 @@ pub async fn finish_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<()> {
 
 /// Look up a batch by UUID.
 pub async fn get_batch(pool: &SqlitePool, id: Uuid) -> Result<Option<Batch>> {
-    sqlx::query(BATCH_SELECT_COLS)
+    sqlx::query(BATCH_SELECT_BY_ID)
         .bind(id.to_string())
         .fetch_optional(pool)
         .await
@@ -141,7 +143,8 @@ pub async fn get_batch(pool: &SqlitePool, id: Uuid) -> Result<Option<Batch>> {
 /// Look up a batch by name.
 pub async fn get_batch_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Batch>> {
     sqlx::query(
-        "SELECT id, name, clang_version, series, builder_backend, started_at, finished_at
+        "SELECT id, name, compiler_type, compiler_version, series,
+                profile_name, profile_content, builder_backend, started_at, finished_at
          FROM batches WHERE name = ?",
     )
     .bind(name)
@@ -155,7 +158,8 @@ pub async fn get_batch_by_name(pool: &SqlitePool, name: &str) -> Result<Option<B
 /// Get the most recently started batch.
 pub async fn get_latest_batch(pool: &SqlitePool) -> Result<Option<Batch>> {
     sqlx::query(
-        "SELECT id, name, clang_version, series, builder_backend, started_at, finished_at
+        "SELECT id, name, compiler_type, compiler_version, series,
+                profile_name, profile_content, builder_backend, started_at, finished_at
          FROM batches ORDER BY started_at DESC LIMIT 1",
     )
     .fetch_optional(pool)
@@ -168,7 +172,8 @@ pub async fn get_latest_batch(pool: &SqlitePool) -> Result<Option<Batch>> {
 /// List all batches, most recent first.
 pub async fn list_batches(pool: &SqlitePool) -> Result<Vec<Batch>> {
     sqlx::query(
-        "SELECT id, name, clang_version, series, builder_backend, started_at, finished_at
+        "SELECT id, name, compiler_type, compiler_version, series,
+                profile_name, profile_content, builder_backend, started_at, finished_at
          FROM batches ORDER BY started_at DESC",
     )
     .fetch_all(pool)
@@ -179,8 +184,9 @@ pub async fn list_batches(pool: &SqlitePool) -> Result<Vec<Batch>> {
     .collect()
 }
 
-const BATCH_SELECT_COLS: &str =
-    "SELECT id, name, clang_version, series, builder_backend, started_at, finished_at
+const BATCH_SELECT_BY_ID: &str =
+    "SELECT id, name, compiler_type, compiler_version, series,
+            profile_name, profile_content, builder_backend, started_at, finished_at
      FROM batches WHERE id = ?";
 
 fn batch_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Batch> {
@@ -192,8 +198,11 @@ fn batch_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Batch> {
     Ok(Batch {
         id: Uuid::parse_str(&id_str)?,
         name: row.get("name"),
-        clang_version: row.get("clang_version"),
+        compiler_type: row.get("compiler_type"),
+        compiler_version: row.get("compiler_version"),
         series: row.get("series"),
+        profile_name: row.get("profile_name"),
+        profile_content: row.get("profile_content"),
         builder_backend: backend_str
             .parse()
             .map_err(|e: String| anyhow::anyhow!(e))?,
@@ -216,7 +225,7 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         "INSERT INTO builds (
             id, batch_id, source_package, version, status,
             build_duration_seconds, peak_memory_mb, disk_usage_mb,
-            build_log, compiler_invocations, submitted_at, completed_at
+            build_log, compiler_detected, submitted_at, completed_at
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
@@ -256,7 +265,7 @@ pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<V
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
                 build_duration_seconds, peak_memory_mb, disk_usage_mb,
-                build_log, compiler_invocations, submitted_at, completed_at
+                build_log, compiler_detected, submitted_at, completed_at
          FROM builds WHERE batch_id = ? ORDER BY submitted_at",
     )
     .bind(batch_id.to_string())
@@ -287,7 +296,7 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
         peak_memory_mb: row.get("peak_memory_mb"),
         disk_usage_mb: row.get("disk_usage_mb"),
         build_log: row.get("build_log"),
-        compiler_detected: row.get("compiler_invocations"),
+        compiler_detected: row.get("compiler_detected"),
         submitted_at: DateTime::parse_from_rfc3339(&submitted_str)?.with_timezone(&Utc),
         completed_at: completed_str
             .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))

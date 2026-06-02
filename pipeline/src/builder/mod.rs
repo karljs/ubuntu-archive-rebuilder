@@ -12,6 +12,7 @@ pub use time_parser::parse_time_output;
 use crate::analyzer::scan_log;
 use crate::db::{self, BatchStats};
 use crate::models::{BuildResult, BuildStatus, BuilderBackend};
+use crate::profile::Profile;
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use tokio::signal::unix::{signal, SignalKind};
@@ -21,8 +22,7 @@ use uuid::Uuid;
 
 /// Parameters for a full batch build run (multiple packages).
 pub struct BuildConfig {
-    pub clang_version: String,
-    pub series: String,
+    pub profile: Profile,
     pub packages: Vec<String>,
     pub timeout_seconds: u64,
     pub verbose: bool,
@@ -41,8 +41,7 @@ pub async fn run_batch(
 ) -> Result<(Uuid, BatchStats)> {
     let batch = db::create_batch(
         pool,
-        &config.clang_version,
-        &config.series,
+        &config.profile,
         BuilderBackend::Sbuild,
     )
     .await?;
@@ -127,14 +126,17 @@ async fn build_package(
 ) -> Result<BuildResult> {
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
 
+    let series = &config.profile.target.series;
     info!(package = %package_name, "Fetching source");
-    let source = fetch_source(package_name, &config.series, temp_dir.path()).await?;
+    let source = fetch_source(package_name, series, temp_dir.path()).await?;
 
     info!(package = %package_name, version = %source.version, "Running sbuild");
     let sbuild_config = SbuildConfig {
         dsc_path: source.dsc_path,
-        series: config.series.clone(),
-        clang_version: config.clang_version.clone(),
+        series: series.clone(),
+        compiler_type: config.profile.compiler.compiler_type,
+        compiler_version: config.profile.compiler.version.clone(),
+        build_env: config.profile.build_env_vars(),
         timeout_seconds: config.timeout_seconds,
         verbose: config.verbose,
         run_tests: config.run_tests,

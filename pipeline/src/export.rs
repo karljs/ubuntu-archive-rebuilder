@@ -1,4 +1,4 @@
-//! Export module - generates JSON data files for the report viewer
+//! Export module — generates JSON data files for the report viewer.
 
 use crate::db;
 use anyhow::Result;
@@ -9,19 +9,21 @@ use tokio::fs;
 use tracing::info;
 use uuid::Uuid;
 
-/// Summary of a batch for the index
+/// Summary of a batch for the index.
 #[derive(Serialize)]
 pub struct BatchSummary {
     pub id: String,
     pub name: String,
-    pub clang_version: String,
+    pub compiler_type: String,
+    pub compiler_version: String,
     pub series: String,
+    pub profile_name: String,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub stats: BatchStats,
 }
 
-/// Statistics for a batch
+/// Statistics for a batch.
 #[derive(Serialize)]
 pub struct BatchStats {
     pub total: i64,
@@ -31,20 +33,22 @@ pub struct BatchStats {
     pub timeout: i64,
 }
 
-/// Detailed batch data including builds
+/// Detailed batch data including builds.
 #[derive(Serialize)]
 pub struct BatchDetail {
     pub id: String,
     pub name: String,
-    pub clang_version: String,
+    pub compiler_type: String,
+    pub compiler_version: String,
     pub series: String,
+    pub profile_name: String,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub builds: Vec<BuildSummary>,
     pub finding_summary: Vec<FindingCount>,
 }
 
-/// Summary of a build for the batch detail
+/// Summary of a build for the batch detail.
 #[derive(Serialize)]
 pub struct BuildSummary {
     pub id: String,
@@ -56,14 +60,14 @@ pub struct BuildSummary {
     pub finding_count: i64,
 }
 
-/// Count of findings by category
+/// Count of findings by category.
 #[derive(Serialize)]
 pub struct FindingCount {
     pub category: String,
     pub count: i64,
 }
 
-/// Detailed build data including findings
+/// Detailed build data including findings.
 #[derive(Serialize)]
 pub struct BuildDetail {
     pub id: String,
@@ -76,7 +80,7 @@ pub struct BuildDetail {
     pub findings: Vec<Finding>,
 }
 
-/// A single finding/error from a build
+/// A single finding/error from a build.
 #[derive(Serialize)]
 pub struct Finding {
     pub category: String,
@@ -85,7 +89,7 @@ pub struct Finding {
     pub line_number: Option<i64>,
 }
 
-/// Export all data to the output directory
+/// Export all data to the output directory.
 pub async fn export_data(
     pool: &SqlitePool,
     output_dir: &Path,
@@ -99,7 +103,7 @@ pub async fn export_data(
 
     // Get all batches (for index.json, always include all for navigation)
     let all_batches = db::list_batches(pool).await?;
-    
+
     // Build index with summaries
     let mut batch_summaries = Vec::new();
     for batch in &all_batches {
@@ -107,8 +111,10 @@ pub async fn export_data(
         batch_summaries.push(BatchSummary {
             id: batch.id.to_string(),
             name: batch.name.clone(),
-            clang_version: batch.clang_version.clone(),
+            compiler_type: batch.compiler_type.clone(),
+            compiler_version: batch.compiler_version.clone(),
             series: batch.series.clone(),
+            profile_name: batch.profile_name.clone(),
             started_at: batch.started_at.to_rfc3339(),
             finished_at: batch.finished_at.map(|t| t.to_rfc3339()),
             stats: BatchStats {
@@ -144,7 +150,7 @@ pub async fn export_data(
     Ok(())
 }
 
-/// Export a single batch and all its builds
+/// Export a single batch and all its builds.
 async fn export_batch(
     pool: &SqlitePool,
     output_dir: &Path,
@@ -154,7 +160,7 @@ async fn export_batch(
 
     // Get builds for this batch
     let builds = db::get_builds_for_batch(pool, batch.id).await?;
-    
+
     // Get finding summary
     let finding_stats = db::get_finding_stats(pool, batch.id).await?;
 
@@ -176,8 +182,10 @@ async fn export_batch(
     let batch_detail = BatchDetail {
         id: batch.id.to_string(),
         name: batch.name.clone(),
-        clang_version: batch.clang_version.clone(),
+        compiler_type: batch.compiler_type.clone(),
+        compiler_version: batch.compiler_version.clone(),
         series: batch.series.clone(),
+        profile_name: batch.profile_name.clone(),
         started_at: batch.started_at.to_rfc3339(),
         finished_at: batch.finished_at.map(|t| t.to_rfc3339()),
         builds: build_summaries,
@@ -203,7 +211,7 @@ async fn export_batch(
     Ok(())
 }
 
-/// Export a single build's details and log
+/// Export a single build's details and log.
 async fn export_build(
     pool: &SqlitePool,
     output_dir: &Path,

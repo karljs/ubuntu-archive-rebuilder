@@ -4,15 +4,21 @@
 //! timeout / Ctrl+C cancellation via process-group isolation (`setpgid` /
 //! `killpg`) so the entire sbuild process tree is cleaned up reliably.
 //!
-//! Compiler substitution happens in two phases injected into sbuild's
-//! external-command hooks:
+//! For **clang** profiles, compiler substitution happens in two phases
+//! injected into sbuild's external-command hooks:
 //!
 //! 1. **chroot-setup-commands** (before dep installation) — installs the
 //!    target clang version.
 //! 2. **starting-build-commands** (after dep installation, before
 //!    dpkg-buildpackage) — diverts gcc/g++/cc/c++ to clang wrappers and
-//!    verifies the substitution succeeded.  If verification fails the build
-//!    is aborted so we never silently measure gcc instead of clang.
+//!    verifies the substitution succeeded.
+//!
+//! For **gcc** profiles, the chroot setup is skipped (gcc is already
+//! present via build-deps) and a lightweight verification script records
+//! the gcc version.
+//!
+//! Profile flags are injected into the starting-build script as
+//! `DEB_*_APPEND` exports.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -29,21 +35,26 @@ use tracing::{debug, info, trace, warn};
 
 use crate::builder::time_parser::parse_time_output;
 use crate::models::BuildStatus;
+use crate::profile::CompilerType;
 
 // ---------------------------------------------------------------------------
 // Shell script templates — loaded at compile time from external files so they
-// can be linted with shellcheck independently.  The placeholder
-// `__CLANG_VERSION__` is substituted at runtime.
+// can be linted with shellcheck independently.  Placeholders are substituted
+// at runtime.
 // ---------------------------------------------------------------------------
 
 const CHROOT_SETUP_SCRIPT: &str = include_str!("scripts/chroot_setup.sh");
 const STARTING_BUILD_SCRIPT: &str = include_str!("scripts/starting_build.sh");
+const GCC_VERIFY_SCRIPT: &str = include_str!("scripts/gcc_verify.sh");
 
 /// Configuration for a single sbuild invocation.
 pub struct SbuildConfig {
     pub dsc_path: PathBuf,
     pub series: String,
-    pub clang_version: String,
+    pub compiler_type: CompilerType,
+    pub compiler_version: String,
+    /// Extra environment variables for the build (from profile flags).
+    pub build_env: Vec<(String, String)>,
     pub timeout_seconds: u64,
     pub verbose: bool,
     pub run_tests: bool,
@@ -154,7 +165,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     let exit_status = child.wait().await.context("Failed to wait for sbuild")?;
     let log = log_lines.join("\n");
     let metrics = parse_time_output(&time_output);
-    let compiler_detected = detect_compiler_from_log(&log);
+    let compiler_detected = detect_compiler_from_log(&log, config.compiler_type);
 
     let status = if timed_out {
         BuildStatus::Timeout
@@ -177,23 +188,13 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
 
 /// Assemble the full `Command` for `/usr/bin/time -v sbuild …`.
 ///
-/// Separated from `run_sbuild` so the process-management code doesn't have
-/// to share vertical space with argument construction.
+/// For clang profiles, injects chroot-setup (clang install) and
+/// starting-build (gcc-to-clang wrapper) scripts.  For gcc profiles,
+/// only injects a lightweight verification script.
 fn build_command(config: &SbuildConfig) -> Result<Command> {
     let dsc_dir = config.dsc_path.parent().context("Invalid .dsc path")?;
 
-    let setup_cmd = wrap_in_heredoc(
-        "clang-install.sh",
-        "CLANG_INSTALL_EOF",
-        &CHROOT_SETUP_SCRIPT.replace("__CLANG_VERSION__", &config.clang_version),
-    );
-    let starting_cmd = wrap_in_heredoc(
-        "clang-wrapper-setup.sh",
-        "CLANG_WRAPPER_EOF",
-        &STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", &config.clang_version),
-    );
-
-    let sbuild_config_file = generate_sbuild_config(config.jobs, config.run_tests)?;
+    let sbuild_config_file = generate_sbuild_config(config.jobs, config.run_tests, &config.build_env)?;
 
     // sbuild's unshare mode extracts chroots into $TMPDIR which defaults to
     // /tmp.  On this machine /tmp is a 44 GB tmpfs — large builds exhaust it.
@@ -208,10 +209,36 @@ fn build_command(config: &SbuildConfig) -> Result<Command> {
         .arg("--verbose")
         .arg("--batch")
         .arg("--chroot-mode=unshare")
-        .arg(format!("--dist={}", config.series))
-        .arg(format!("--chroot-setup-commands={setup_cmd}"))
-        .arg(format!("--starting-build-commands={starting_cmd}"))
-        .arg("--no-clean-source")
+        .arg(format!("--dist={}", config.series));
+
+    // Compiler-specific setup scripts.
+    match config.compiler_type {
+        CompilerType::Clang => {
+            let setup_cmd = wrap_in_heredoc(
+                "clang-install.sh",
+                "CLANG_INSTALL_EOF",
+                &CHROOT_SETUP_SCRIPT.replace("__CLANG_VERSION__", &config.compiler_version),
+            );
+            let starting_cmd = wrap_in_heredoc(
+                "clang-wrapper-setup.sh",
+                "CLANG_WRAPPER_EOF",
+                &STARTING_BUILD_SCRIPT
+                    .replace("__CLANG_VERSION__", &config.compiler_version),
+            );
+            cmd.arg(format!("--chroot-setup-commands={setup_cmd}"));
+            cmd.arg(format!("--starting-build-commands={starting_cmd}"));
+        }
+        CompilerType::Gcc => {
+            let starting_cmd = wrap_in_heredoc(
+                "gcc-verify.sh",
+                "GCC_VERIFY_EOF",
+                GCC_VERIFY_SCRIPT,
+            );
+            cmd.arg(format!("--starting-build-commands={starting_cmd}"));
+        }
+    }
+
+    cmd.arg("--no-clean-source")
         .arg(&config.dsc_path)
         .current_dir(dsc_dir)
         .env("SBUILD_CONFIG", sbuild_config_file.path())
@@ -253,9 +280,25 @@ fn wrap_in_heredoc(filename: &str, delimiter: &str, body: &str) -> String {
 /// Generate a Perl config file that overrides the user's `~/.sbuildrc`.
 ///
 /// Loaded via `SBUILD_CONFIG` which sbuild evaluates after system and user
-/// configs, so all assignments here take precedence.
-fn generate_sbuild_config(jobs: usize, run_tests: bool) -> Result<tempfile::NamedTempFile> {
+/// configs, so all assignments here take precedence.  Profile flags are
+/// injected into `$build_environment` so they reach `dpkg-buildpackage`.
+fn generate_sbuild_config(
+    jobs: usize,
+    run_tests: bool,
+    build_env: &[(String, String)],
+) -> Result<tempfile::NamedTempFile> {
     let nocheck = if run_tests { "" } else { " nocheck" };
+
+    // Build the Perl hash entries for $build_environment.
+    let mut env_entries = vec![
+        format!("    'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',"),
+    ];
+    for (var, value) in build_env {
+        // Perl single-quote escaping: replace ' with '\'' .
+        let escaped = value.replace('\'', "'\\''");
+        env_entries.push(format!("    '{var}' => '{escaped}',"));
+    }
+    let env_block = env_entries.join("\n");
 
     let mut file = tempfile::Builder::new()
         .prefix("rebuild-sbuild-")
@@ -269,7 +312,7 @@ fn generate_sbuild_config(jobs: usize, run_tests: bool) -> Result<tempfile::Name
 # Loaded via SBUILD_CONFIG after user config; all values here win.
 
 $build_environment = {{
-    'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',
+{env_block}
 }};
 
 $external_commands = {{
@@ -347,13 +390,16 @@ fn is_time_output(line: &str) -> bool {
 // Build log analysis
 // ---------------------------------------------------------------------------
 
-/// Examine the build log for our `REBUILD:` verification markers to confirm
-/// that the clang wrapper setup succeeded and gcc actually calls clang.
+/// Examine the build log for `REBUILD:` verification markers to confirm
+/// the expected compiler was used.
+///
+/// For clang builds, checks that gcc was successfully replaced with clang.
+/// For gcc builds, checks that gcc was confirmed present.
 ///
 /// sbuild echoes the full script source before executing it, so markers
 /// appearing inside `echo "…"` lines are skipped — only actual output lines
 /// (those starting at column 0 with the marker prefix) are considered.
-fn detect_compiler_from_log(log: &str) -> String {
+fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
     let mut success = false;
     let mut failed = false;
     let mut version_line: Option<&str> = None;
@@ -369,18 +415,30 @@ fn detect_compiler_from_log(log: &str) -> String {
             continue;
         }
 
-        if trimmed == "REBUILD: SUCCESS - gcc is now clang" {
-            success = true;
-        }
-        if trimmed.starts_with("REBUILD-ERROR: FAILED - gcc is NOT reporting as clang") {
-            failed = true;
-        }
-        if trimmed.starts_with("REBUILD:   gcc --version:") && trimmed.contains("clang") {
-            version_line = Some(trimmed);
+        match compiler_type {
+            CompilerType::Clang => {
+                if trimmed == "REBUILD: SUCCESS - gcc is now clang" {
+                    success = true;
+                }
+                if trimmed.starts_with("REBUILD-ERROR: FAILED - gcc is NOT reporting as clang") {
+                    failed = true;
+                }
+                if trimmed.starts_with("REBUILD:   gcc --version:") && trimmed.contains("clang") {
+                    version_line = Some(trimmed);
+                }
+            }
+            CompilerType::Gcc => {
+                if trimmed == "REBUILD: SUCCESS - gcc confirmed" {
+                    success = true;
+                }
+                if trimmed.starts_with("REBUILD:   gcc --version:") && trimmed.contains("gcc") {
+                    version_line = Some(trimmed);
+                }
+            }
         }
     }
 
-    if failed && !success {
+    if compiler_type == CompilerType::Clang && failed && !success {
         return "ERROR: gcc wrapper setup FAILED - built with real GCC".into();
     }
 
@@ -390,10 +448,12 @@ fn detect_compiler_from_log(log: &str) -> String {
                 .split("gcc --version:")
                 .nth(1)
                 .map(str::trim)
-                .unwrap_or("clang (version unknown)");
-            return format!("clang confirmed: {version}");
+                .unwrap_or("version unknown");
+            let label = compiler_type.as_str();
+            return format!("{label} confirmed: {version}");
         }
-        return "clang confirmed".into();
+        let label = compiler_type.as_str();
+        return format!("{label} confirmed");
     }
 
     "UNKNOWN: no compiler verification markers found in log".into()
@@ -486,7 +546,8 @@ mod tests {
 
     #[test]
     fn starting_build_substitutes_version() {
-        let script = STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", "19");
+        let script = STARTING_BUILD_SCRIPT
+            .replace("__CLANG_VERSION__", "19");
         assert!(script.contains(r#"CLANG_VERSION="19""#));
         assert!(!script.contains("__CLANG_VERSION__"));
     }
@@ -495,6 +556,18 @@ mod tests {
     fn starting_build_contains_verification_markers() {
         assert!(STARTING_BUILD_SCRIPT.contains("REBUILD: SUCCESS"));
         assert!(STARTING_BUILD_SCRIPT.contains("REBUILD-ERROR: FAILED"));
+    }
+
+    #[test]
+    fn starting_build_no_placeholders_remain() {
+        let script = STARTING_BUILD_SCRIPT
+            .replace("__CLANG_VERSION__", "18");
+        assert!(!script.contains("__CLANG_VERSION__"));
+    }
+
+    #[test]
+    fn gcc_verify_script_contains_markers() {
+        assert!(GCC_VERIFY_SCRIPT.contains("REBUILD: SUCCESS - gcc confirmed"));
     }
 
     #[test]
@@ -511,20 +584,29 @@ mod tests {
     fn detects_clang_confirmed() {
         let log = "REBUILD:   gcc --version: Ubuntu clang version 18.1.3\n\
                    REBUILD: SUCCESS - gcc is now clang\n";
-        let result = detect_compiler_from_log(log);
+        let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(result.starts_with("clang confirmed"), "got: {result}");
         assert!(result.contains("18.1.3"), "got: {result}");
     }
 
     #[test]
+    fn detects_gcc_confirmed() {
+        let log = "REBUILD:   gcc --version: gcc (Ubuntu 13.3.0-6ubuntu2) 13.3.0\n\
+                   REBUILD: SUCCESS - gcc confirmed\n";
+        let result = detect_compiler_from_log(log, CompilerType::Gcc);
+        assert!(result.starts_with("gcc confirmed"), "got: {result}");
+        assert!(result.contains("13.3.0"), "got: {result}");
+    }
+
+    #[test]
     fn detects_wrapper_failure() {
         let log = "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n";
-        assert!(detect_compiler_from_log(log).contains("ERROR"));
+        assert!(detect_compiler_from_log(log, CompilerType::Clang).contains("ERROR"));
     }
 
     #[test]
     fn detects_missing_markers() {
-        assert!(detect_compiler_from_log("some build output\n").contains("UNKNOWN"));
+        assert!(detect_compiler_from_log("some build output\n", CompilerType::Clang).contains("UNKNOWN"));
     }
 
     #[test]
@@ -534,7 +616,7 @@ mod tests {
             "    echo \"REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\" >&2\n",
             "REBUILD: SUCCESS - gcc is now clang\n",
         );
-        let result = detect_compiler_from_log(log);
+        let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(result.contains("clang confirmed"), "got: {result}");
     }
 
@@ -545,7 +627,7 @@ mod tests {
             "    echo \"REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\" >&2\n",
             "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n",
         );
-        let result = detect_compiler_from_log(log);
+        let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(result.contains("ERROR"), "got: {result}");
     }
 }

@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rebuild_pipeline::{builder, db, export};
+use rebuild_pipeline::{builder, db, export, profile::Profile};
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -11,7 +11,7 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(
     name = "rebuild-pipeline",
-    about = "Ubuntu archive rebuild experiments — build with Clang and analyse results",
+    about = "Ubuntu archive rebuild experiments — build packages with different compilers and analyse results",
     version
 )]
 struct Cli {
@@ -29,15 +29,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Build packages with Clang using sbuild.
+    /// Build packages using a compiler profile.
     Build {
-        /// Clang version to test (e.g. "18", "19").
+        /// Path to a profile TOML file (e.g. profiles/clang-18-noble.toml).
         #[arg(long)]
-        clang_version: String,
-
-        /// Ubuntu series to build for (e.g. "noble").
-        #[arg(long)]
-        series: String,
+        profile: PathBuf,
 
         /// File containing package names to build (one per line).
         #[arg(long)]
@@ -99,13 +95,15 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Build {
-            clang_version,
-            series,
+            profile: profile_path,
             packages,
             timeout,
             jobs,
             run_tests,
         } => {
+            let profile = Profile::load(&profile_path)?;
+            profile.validate_series_available()?;
+
             let package_list = read_package_list(&packages)?;
             if package_list.is_empty() {
                 bail!("No packages to build");
@@ -119,13 +117,16 @@ async fn main() -> Result<()> {
 
             info!(
                 packages = package_list.len(),
-                %clang_version, %series, jobs,
+                profile = %profile.name,
+                compiler = %profile.compiler.compiler_type,
+                version = %profile.compiler.version,
+                series = %profile.target.series,
+                jobs,
                 "Starting build run"
             );
 
             let config = builder::BuildConfig {
-                clang_version,
-                series,
+                profile,
                 packages: package_list,
                 timeout_seconds: timeout,
                 verbose: cli.verbose,
@@ -149,13 +150,14 @@ async fn main() -> Result<()> {
             if batches.is_empty() {
                 println!("No batches found.");
             } else {
-                println!("{:<20}  {:<8}  {:<10}  {:<20}", "STARTED", "CLANG", "SERIES", "NAME");
-                println!("{}", "-".repeat(65));
+                println!("{:<20}  {:<8}  {:<8}  {:<10}  {:<20}", "STARTED", "COMPILER", "VERSION", "SERIES", "NAME");
+                println!("{}", "-".repeat(75));
                 for b in batches {
                     println!(
-                        "{:<20}  {:<8}  {:<10}  {:<20}",
+                        "{:<20}  {:<8}  {:<8}  {:<10}  {:<20}",
                         b.started_at.format("%Y-%m-%d %H:%M:%S"),
-                        b.clang_version,
+                        b.compiler_type,
+                        b.compiler_version,
                         b.series,
                         b.name,
                     );
@@ -170,8 +172,9 @@ async fn main() -> Result<()> {
 
             println!("Batch: {}", batch.name);
             println!("  ID: {}", batch.id);
-            println!("  Clang version: {}", batch.clang_version);
+            println!("  Compiler: {} {}", batch.compiler_type, batch.compiler_version);
             println!("  Series: {}", batch.series);
+            println!("  Profile: {}", batch.profile_name);
             println!("  Backend: {}", batch.builder_backend.as_str());
             println!("  Started: {}", batch.started_at);
             if let Some(finished) = batch.finished_at {

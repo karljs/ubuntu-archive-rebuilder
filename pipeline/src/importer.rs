@@ -1,8 +1,12 @@
-//! Log importer - imports build logs from various sources
+//! Log importer — imports build logs from external sources.
+//!
+//! Creates a batch from a profile and imports pre-existing build logs
+//! with associated metadata.
 
 use crate::analyzer::{infer_status_from_log, scan_log};
 use crate::db;
 use crate::models::{BuildStatus, BuilderBackend};
+use crate::profile::Profile;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -12,7 +16,7 @@ use std::path::Path;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// Metadata for a single build, provided externally
+/// Metadata for a single build, provided externally.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BuildMetadata {
     pub source_package: String,
@@ -31,21 +35,20 @@ pub struct BuildMetadata {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-/// Metadata file format - maps log filenames to build metadata
+/// Metadata file format — maps log filenames to build metadata.
 #[derive(Debug, Deserialize)]
 pub struct MetadataFile {
-    /// Map from log filename (without path) to metadata
+    /// Map from log filename (without path) to metadata.
     pub builds: HashMap<String, BuildMetadata>,
 }
 
-/// Import logs from a directory
+/// Import logs from a directory.
 ///
-/// Creates a new batch automatically and imports all logs into it.
+/// Creates a new batch from the given profile and imports all logs into it.
 /// Requires a metadata file to provide package names, versions, and metrics.
 pub async fn import_from_directory(
     pool: &SqlitePool,
-    clang_version: &str,
-    series: &str,
+    profile: &Profile,
     log_dir: &Path,
     metadata_path: &Path,
 ) -> Result<(Uuid, ImportStats)> {
@@ -56,7 +59,7 @@ pub async fn import_from_directory(
         serde_json::from_str(&content).context("Failed to parse metadata file")?;
 
     // Create batch
-    let batch = db::create_batch(pool, clang_version, series, BuilderBackend::External).await?;
+    let batch = db::create_batch(pool, profile, BuilderBackend::External).await?;
 
     info!(
         batch_id = %batch.id,

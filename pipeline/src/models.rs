@@ -87,14 +87,17 @@ impl std::str::FromStr for BuilderBackend {
     }
 }
 
-/// A batch is a collection of builds for a specific clang version + series.
+/// A batch is a collection of builds sharing a compiler profile.
 /// Each `build` invocation creates a new batch automatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Batch {
     pub id: Uuid,
     pub name: String,
-    pub clang_version: String,
+    pub compiler_type: String,
+    pub compiler_version: String,
     pub series: String,
+    pub profile_name: String,
+    pub profile_content: String,
     pub builder_backend: BuilderBackend,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
