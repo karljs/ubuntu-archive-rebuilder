@@ -28,6 +28,15 @@ pub fn scan_log(log: &str) -> Vec<Finding> {
     let mut seen_categories = std::collections::HashSet::new();
 
     for (idx, line) in lines.iter().enumerate() {
+        // Skip lines that are pure compiler warnings — they are only a finding
+        // if the build also uses -Werror and the warning is subsequently promoted
+        // to an error (which would appear on a separate "error:" line).
+        // This prevents format-string and -Wunused warnings from showing as
+        // findings on builds that don't use -Werror.
+        if line.contains("warning:") && !line.contains("error:") {
+            continue;
+        }
+
         if let Some(pattern) = match_pattern(line) {
             if seen_categories.insert(pattern.key) {
                 let excerpt = extract_context(&lines, idx, 2);
@@ -153,6 +162,25 @@ error: undefined reference to `baz'
         // A success marker in the log should not win against a non-zero exit.
         let log = "Build finished successfully";
         assert_eq!(infer_status(log, Some(1)), BuildStatus::Failed);
+    }
+
+    #[test]
+    fn test_warning_only_line_not_a_finding() {
+        // A bare warning (e.g. barcode with -Wformat-security) should not
+        // produce a finding — only promoted errors (lines with "error:") count.
+        let log = "barcode.c:42:5: warning: format string is not a string literal [-Wformat-security]";
+        let findings = scan_log(log);
+        assert!(findings.is_empty(), "pure warning lines must not produce findings");
+    }
+
+    #[test]
+    fn test_werror_promoted_warning_is_a_finding() {
+        // When -Werror promotes a warning to an error, the follow-up "error:" line
+        // should still be caught.
+        let log = "barcode.c:42:5: warning: format string is not a string literal [-Wformat-security]\n\
+                   barcode.c:42:5: error: format string is not a string literal [-Werror,-Wformat-security]";
+        let findings = scan_log(log);
+        assert!(!findings.is_empty(), "Werror-promoted error lines must be caught");
     }
 
     #[test]

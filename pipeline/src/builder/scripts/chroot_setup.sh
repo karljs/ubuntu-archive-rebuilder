@@ -8,6 +8,12 @@
 # Placeholder __CLANG_VERSION__ is replaced at runtime by the pipeline.
 set -e
 
+# Prevent dpkg-preconfigure/debconf from trying to open /dev/tty.  The
+# pipeline puts sbuild in its own process group (for killpg), which makes it
+# a background group on the terminal.  A background read on /dev/tty triggers
+# SIGTTIN and stops the entire install.
+export DEBIAN_FRONTEND=noninteractive
+
 CLANG_VERSION="__CLANG_VERSION__"
 echo "=== REBUILD: Installing Clang $CLANG_VERSION ==="
 

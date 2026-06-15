@@ -1,0 +1,18 @@
+# Clang 14 on Jammy with workarounds for known toolchain issues.
+
+[compiler]
+type = "clang"
+version = "14"
+
+[target]
+series = "jammy"
+
+[[flags]]
+var = "DEB_CFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Jammy's dwz 0.14 doesn't support DWARF5 (Clang 14 defaults to DWARF5)"
+
+[[flags]]
+var = "DEB_CXXFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Jammy's dwz 0.14 doesn't support DWARF5 (Clang 14 defaults to DWARF5)"

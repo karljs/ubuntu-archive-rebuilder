@@ -4,27 +4,60 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rebuild Experiments</title>
-    <link rel="stylesheet" href="style.css?v=2">
+    <link rel="stylesheet" href="style.css?v=3">
     <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
     <div id="loading-overlay" class="loading-overlay">
         <p>Loading database&hellip;</p>
     </div>
-    <header>
-        <div class="header-left">
-            <h1>Rebuild Experiments</h1>
-            <div class="dropdown" id="batch-select-dd">
-                <button class="dropdown-toggle" type="button">Loading...</button>
-                <ul class="dropdown-menu"></ul>
-            </div>
-            <button id="compare-btn" class="btn">Compare</button>
-        </div>
-        <div id="batch-info" class="header-right"></div>
-    </header>
 
-    <!-- Single batch view -->
-    <div id="single-view">
+    <!-- Tab bar -->
+    <nav class="tab-bar">
+        <span class="tab-bar-title">Rebuild Experiments</span>
+        <button class="tab-btn active" data-tab="builds">Builds</button>
+        <button class="tab-btn" data-tab="trends">Trends</button>
+        <button class="tab-btn" data-tab="categories">Categories</button>
+        <button class="tab-btn" data-tab="compare">Compare</button>
+    </nav>
+
+    <!-- ════════════════ Builds tab ════════════════ -->
+    <div id="tab-builds" class="tab-panel active">
+        <div class="builds-toolbar">
+            <div class="builds-toolbar-left">
+                <div class="dropdown" id="batch-select-dd">
+                    <button class="dropdown-toggle" type="button">Loading...</button>
+                    <ul class="dropdown-menu"></ul>
+                </div>
+            </div>
+            <div class="builds-toolbar-right">
+                <div class="batch-filters">
+                    <span class="batch-filters-label">Batch filters</span>
+                    <div class="batch-filters-controls">
+                        <label class="filter-label">Compiler
+                            <div class="dropdown" id="filter-compiler-dd">
+                                <button class="dropdown-toggle" type="button">All</button>
+                                <ul class="dropdown-menu"></ul>
+                            </div>
+                        </label>
+                        <label class="filter-label">Version
+                            <div class="dropdown" id="filter-version-dd">
+                                <button class="dropdown-toggle" type="button">All</button>
+                                <ul class="dropdown-menu"></ul>
+                            </div>
+                        </label>
+                        <label class="filter-label">Series
+                            <div class="dropdown" id="filter-series-dd">
+                                <button class="dropdown-toggle" type="button">All</button>
+                                <ul class="dropdown-menu"></ul>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <div id="status-bar" class="status-bar"></div>
 
         <div class="content-columns">
@@ -69,18 +102,88 @@
         </div>
     </div>
 
-    <!-- Compare view -->
-    <div id="compare-view" class="hidden">
-        <div class="compare-header">
-            <label>A: <div class="dropdown" id="compare-batch-a-dd"><button class="dropdown-toggle" type="button">--</button><ul class="dropdown-menu"></ul></div></label>
-            <label>B: <div class="dropdown" id="compare-batch-b-dd"><button class="dropdown-toggle" type="button">--</button><ul class="dropdown-menu"></ul></div></label>
-            <button id="run-compare" class="btn btn-primary">Compare</button>
-            <button id="exit-compare" class="btn">Back</button>
+    <!-- ════════════════ Trends tab ════════════════ -->
+    <div id="tab-trends" class="tab-panel">
+        <div class="view-toolbar">
+            <div class="view-toolbar-left">
+                <span class="toolbar-label">Trend by</span>
+                <label class="radio-label"><input type="radio" name="trend-mode" value="version" checked> Compiler version</label>
+                <label class="radio-label"><input type="radio" name="trend-mode" value="series"> Ubuntu series</label>
+            </div>
         </div>
-        <div id="compare-content"></div>
+        <div class="trends-body">
+            <div class="trends-config">
+                <h3>Profiles to include</h3>
+                <div id="trends-profile-checks" class="checkbox-grid"></div>
+            </div>
+            <div class="trends-chart-area">
+                <div class="chart-card">
+                    <h3>Success Rate</h3>
+                    <p id="trends-rate-desc" class="muted chart-desc">Success rate across compiler versions. One line per selected profile.</p>
+                    <div class="chart-wrap chart-wrap-lg"><canvas id="chart-success-rate"></canvas></div>
+                </div>
+                <div class="chart-card">
+                    <h3>Outcome Breakdown</h3>
+                    <p class="muted chart-desc">Build outcomes as stacked areas. Shows how failures distribute across categories.</p>
+                    <div class="chart-wrap chart-wrap-lg"><canvas id="chart-outcome-area"></canvas></div>
+                </div>
+            </div>
+        </div>
     </div>
 
-    <!-- Build details modal -->
+    <!-- ════════════════ Categories tab ════════════════ -->
+    <div id="tab-categories" class="tab-panel">
+        <div class="view-toolbar">
+            <div class="view-toolbar-left">
+                <span class="toolbar-label">Failure categories across selected batches</span>
+            </div>
+            <div class="view-toolbar-right">
+                <label class="toolbar-add-label">Add batch:
+                    <div class="dropdown" id="cat-add-batch-dd">
+                        <button class="dropdown-toggle" type="button">Select...</button>
+                        <ul class="dropdown-menu"></ul>
+                    </div>
+                </label>
+                <button id="cat-add-btn" class="btn btn-primary btn-sm">Add</button>
+            </div>
+        </div>
+        <div class="categories-body">
+            <div class="cat-batch-list-wrap">
+                <h3>Selected batches <span class="muted">(drag to reorder)</span></h3>
+                <ul id="cat-batch-list" class="cat-batch-list"></ul>
+                <p id="cat-empty-msg" class="muted">Add batches above to compare failure categories.</p>
+            </div>
+            <div class="cat-chart-area">
+                <div class="chart-card">
+                    <div class="chart-wrap chart-wrap-lg"><canvas id="chart-failure-cats"></canvas></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ════════════════ Compare tab ════════════════ -->
+    <div id="tab-compare" class="tab-panel">
+        <div class="view-toolbar">
+            <div class="view-toolbar-left">
+                <label class="compare-label">A:
+                    <div class="dropdown" id="compare-batch-a-dd">
+                        <button class="dropdown-toggle" type="button">--</button>
+                        <ul class="dropdown-menu"></ul>
+                    </div>
+                </label>
+                <label class="compare-label">B:
+                    <div class="dropdown" id="compare-batch-b-dd">
+                        <button class="dropdown-toggle" type="button">--</button>
+                        <ul class="dropdown-menu"></ul>
+                    </div>
+                </label>
+                <button id="run-compare" class="btn btn-primary">Compare</button>
+            </div>
+        </div>
+        <div id="compare-content" class="compare-content"></div>
+    </div>
+
+    <!-- ════════════════ Build details modal ════════════════ -->
     <div id="modal" class="modal hidden">
         <div class="modal-panel">
             <div class="modal-header">
@@ -91,7 +194,7 @@
         </div>
     </div>
 
-    <!-- Log viewer (full viewport) -->
+    <!-- ════════════════ Log viewer (full viewport) ════════════════ -->
     <div id="log-modal" class="modal hidden">
         <div class="modal-panel modal-full">
             <div class="modal-header">
@@ -108,6 +211,6 @@
         </div>
     </div>
 
-    <script src="app.js?v=4"></script>
+    <script src="app.js?v=5"></script>
 </body>
 </html>

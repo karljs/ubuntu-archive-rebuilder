@@ -1,0 +1,8 @@
+# GCC 15 on Resolute -- default compiler baseline.
+
+[compiler]
+type = "gcc"
+version = "15"
+
+[target]
+series = "resolute"

@@ -1,0 +1,26 @@
+# Intermediate test package set — 15 packages.
+# Fast enough to run across multiple profiles; includes a mix of
+# expected successes and packages known to fail with Clang due to
+# GNU extensions (nested functions, statement expressions, etc.)
+# and C++ issues (narrowing conversions, template compatibility).
+
+# ── Expected to succeed with all compilers ──
+diffutils
+attr
+bc
+file
+sed
+grep
+flex
+bison
+expat
+rsync
+
+# ── Expected to fail with Clang, succeed with GCC ──
+# nested functions (GNU extension, not supported by Clang)
+gdbm
+ppp
+barcode
+# C++ narrowing / template issues
+audiofile
+clucene-core

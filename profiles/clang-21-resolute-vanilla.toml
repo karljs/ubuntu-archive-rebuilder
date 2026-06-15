@@ -1,0 +1,10 @@
+# Clang 21 on Resolute with no extra flags -- pure drop-in baseline.
+# Use this to measure the total gap between GCC and Clang, including
+# toolchain issues like dwz/DWARF5 incompatibility.
+
+[compiler]
+type = "clang"
+version = "21"
+
+[target]
+series = "resolute"

@@ -1,0 +1,18 @@
+# Clang 21 on Resolute with workarounds for known toolchain issues.
+
+[compiler]
+type = "clang"
+version = "21"
+
+[target]
+series = "resolute"
+
+[[flags]]
+var = "DEB_CFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Resolute's dwz 0.16 doesn't fully support Clang 21's DWARF5 output (.debug_addr)"
+
+[[flags]]
+var = "DEB_CXXFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Resolute's dwz 0.16 doesn't fully support Clang 21's DWARF5 output (.debug_addr)"

@@ -1,0 +1,8 @@
+# GCC 14 on Noble -- newer GCC baseline, available from noble/universe.
+
+[compiler]
+type = "gcc"
+version = "14"
+
+[target]
+series = "noble"

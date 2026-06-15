@@ -1,0 +1,8 @@
+# GCC 11 on Jammy -- default compiler baseline.
+
+[compiler]
+type = "gcc"
+version = "11"
+
+[target]
+series = "jammy"

@@ -1,0 +1,18 @@
+# Clang 19 on Noble with workarounds for known toolchain issues.
+
+[compiler]
+type = "clang"
+version = "19"
+
+[target]
+series = "noble"
+
+[[flags]]
+var = "DEB_CFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Noble's dwz 0.15 doesn't support DWARF5 (Clang 19 defaults to DWARF5)"
+
+[[flags]]
+var = "DEB_CXXFLAGS_APPEND"
+flag = "-gdwarf-4"
+reason = "Noble's dwz 0.15 doesn't support DWARF5 (Clang 19 defaults to DWARF5)"

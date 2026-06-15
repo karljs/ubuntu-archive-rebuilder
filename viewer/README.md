@@ -28,7 +28,9 @@ The database is produced by `rebuild-pipeline export`. Build logs are stored sep
 
 ## Features
 
-- Batch selector and side-by-side batch comparison
-- Sortable, filterable build table with status breakdown
-- Error finding categories with drill-down
-- Full build logs on demand
+The viewer has four main tabs:
+
+- **Builds** — Browse a single batch: sortable/filterable build table, status breakdown, error categories sidebar, full build logs on demand. Batch filters (compiler/version/series) narrow the batch list.
+- **Trends** — Success rate and outcome breakdown charts across compiler versions or Ubuntu series. A sidebar lets you include/exclude specific profiles (e.g., compare vanilla vs dwarf-4 workaround). Gaps in version data are shown on the X axis.
+- **Categories** — Failure category comparison across user-selected batches. Add, remove, and drag-to-reorder batches to build a custom comparison.
+- **Compare** — Side-by-side diff of two batches: status changes, build time comparison, and peak memory comparison in separate tables.
