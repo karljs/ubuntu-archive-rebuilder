@@ -36,13 +36,15 @@ async function init() {
     try {
         var SQL = await initSqlJs({ locateFile: function(f) { return SQL_JS_CDN + f; } });
         var buf = await fetch(DATA_BASE_URL + '/rebuild.db?v=' + Date.now()).then(function(r) {
-            if (!r.ok) throw new Error('rebuild.db not found — run: rebuild-pipeline export');
+            if (!r.ok) throw new Error('rebuild.db not found — run: rebuilder export');
             return r.arrayBuffer();
         });
         sqlDb = new SQL.Database(new Uint8Array(buf));
         el('loading-overlay').classList.add('hidden');
         loadData();
         setupEventListeners();
+        // Record the initial overview state so the back button can return here.
+        history.replaceState({ tab: 'overview' }, '');
         renderOverview();
     } catch(err) {
         console.error('Init failed:', err);
@@ -67,7 +69,7 @@ function loadData() {
                 };
             });
     } catch(e) {
-        console.warn('profile_configs not found — re-run: rebuild-pipeline export');
+        console.warn('profile_configs not found — re-run: rebuilder export');
     }
 
     var statRows = dbQuery(
@@ -163,7 +165,11 @@ function switchTab(tabName, pushHistory) {
     document.querySelectorAll('.tab-panel').forEach(function(p) {
         p.classList.toggle('active', p.id === 'tab-' + tabName);
     });
-    if (pushHistory !== false) pushView({ tab: tabName, batchId: currentBatch ? currentBatch.id : null });
+    // Callers that want to manage their own history entry pass pushHistory=false.
+    // Plain tab-button clicks pass nothing and get a history entry here.
+    if (pushHistory !== false) {
+        pushView({ tab: tabName, batchId: currentBatch ? currentBatch.id : null });
+    }
 }
 
 function getActiveTab() {
@@ -171,16 +177,19 @@ function getActiveTab() {
     return btn ? btn.dataset.tab : 'overview';
 }
 
-// Navigate to Details for a specific batch (called from Overview row click).
+// Navigate to Details for a specific batch (called from Overview row click,
+// profile comparison, version table, etc.)  One history entry total.
 function navigateToDetails(batchId) {
-    loadDetailsForBatch(batchId, true);
-    switchTab('details');
+    loadDetailsForBatch(batchId, false);  // don't push yet
+    switchTab('details', false);          // don't push yet
+    pushView({ tab: 'details', batchId: batchId });  // push once
 }
 
 // Navigate to Compare pre-populated with an array of batch IDs.
 function navigateToCompare(batchIds) {
     compareSelectedIds = batchIds.slice();
-    switchTab('compare');
+    switchTab('compare', false);          // don't push yet
+    pushView({ tab: 'compare', compareIds: batchIds });  // push once
     renderCompareBatchList();
     renderCompareTable();
 }
@@ -194,7 +203,7 @@ function renderOverview() {
     if (!container) return;
 
     if (batches.length === 0) {
-        container.innerHTML = '<p class="muted" style="padding:1rem">No batches found. Run: rebuild-pipeline export</p>';
+        container.innerHTML = '<p class="muted" style="padding:1rem">No batches found. Run: rebuilder export</p>';
         return;
     }
 
@@ -310,7 +319,9 @@ function loadDetailsForBatch(batchId, pushHistory) {
     renderProfileComparison();
     renderVersionContext();
 
-    if (pushHistory !== false) pushView({ tab: 'details', batchId: batchId });
+    // Only push when called directly (e.g. batch dropdown change).
+    // navigateToDetails() manages its own single push and passes false.
+    if (pushHistory === true) pushView({ tab: 'details', batchId: batchId });
 }
 
 function renderDetailsContext() {
@@ -450,8 +461,12 @@ function renderProfileComparison() {
                                    .map(function(x) { return x.var + ': ' + x.reason; }).join('\n');
                 return '<code title="' + escapeAttr(reasons) + '">' + escapeHtml(f) + '</code>';
             }).join(' ');
-        var isCurrent = p.id === b.id;
-        html += '<tr' + (isCurrent ? ' class="details-current-row"' : '') + '>' +
+         var isCurrent = p.id === b.id;
+         var rowAttrs = isCurrent
+             ? ' class="details-current-row"'
+             : ' class="profile-row" data-action="go-details" data-id="' + escapeAttr(p.id) + '"' +
+               ' title="Open ' + escapeAttr(p.profile_name) + ' in Details"';
+         html += '<tr' + rowAttrs + '>' +
             '<td>' + escapeHtml(p.config.flag_summary) + (isCurrent ? ' <span class="muted">(current)</span>' : '') + '</td>' +
             '<td>' + flagCells + '</td>' +
             '<td class="num mono">' + s.total + '</td>' +
@@ -504,13 +519,14 @@ function renderVersionContext() {
         return;
     }
     panel.classList.remove('hidden');
-    if (ctxEl) ctxEl.textContent = b.compiler_type + ' · ' + b.series + ' · ' + summary;
+    // Subtitle explains exactly what is held constant so the user knows what they are comparing.
+    if (ctxEl) ctxEl.textContent =
+        b.compiler_type + ' on ' + b.series + ', ' + summary + ' — success rate by version';
 
-    var maxRate = 100;
     var html = '<table><thead><tr>' +
         '<th>' + escapeHtml(b.compiler_type) + ' version</th>' +
         '<th class="num">N</th><th class="num">Succeeded</th><th class="num">Failed</th>' +
-        '<th class="num">Rate</th><th style="width:120px">Bar</th>' +
+        '<th class="num">Rate</th>' +
         '</tr></thead><tbody>';
 
     versions.forEach(function(v) {
@@ -519,14 +535,14 @@ function renderVersionContext() {
         var rate = s.total > 0 ? (s.succeeded / s.total * 100) : 0;
         var lowN = s.total < 50;
         var isCurrent = bv.id === b.id;
-        var barW = Math.round(rate);
-        html += '<tr' + (isCurrent ? ' class="details-current-row"' : '') + '>' +
+        html += '<tr class="ver-row' + (isCurrent ? ' details-current-row' : '') + '"' +
+            ' data-action="go-details" data-id="' + escapeAttr(bv.id) + '"' +
+            ' title="Open ' + escapeAttr(bv.profile_name) + ' in Details">' +
             '<td class="mono">' + escapeHtml(v) + (isCurrent ? ' <span class="muted">(current)</span>' : '') + '</td>' +
             '<td class="num mono">' + (lowN ? '⚠ ' : '') + s.total + '</td>' +
             '<td class="num mono s-pass">' + s.succeeded + '</td>' +
             '<td class="num mono s-fail">' + s.failed + '</td>' +
             '<td class="num mono">' + rate.toFixed(1) + '%</td>' +
-            '<td><div class="ver-bar-bg"><div class="ver-bar-fill ' + rateColorClass(rate) + '" style="width:' + barW + '%"></div></div></td>' +
             '</tr>';
     });
     html += '</tbody></table>';
@@ -585,7 +601,7 @@ function renderBuildsTable() {
             '<td class="num mono">' + (b.peak_memory_mb ? b.peak_memory_mb + ' MB' : '-') + '</td>' +
             '<td class="num">' + issues + '</td>' +
             '<td>' +
-                (b.finding_count > 0 ? '<button class="btn-link" data-action="details" data-id="' + b.id + '">details</button> ' : '') +
+                (b.finding_count > 0 ? '<button class="btn-link" data-action="issues" data-id="' + b.id + '">issues</button> ' : '') +
                 '<button class="btn-link" data-action="log" data-id="' + b.id + '" data-pkg="' + escapeAttr(b.package) + '">log</button>' +
             '</td></tr>';
     });
@@ -866,7 +882,7 @@ function setupEventListeners() {
         btn.addEventListener('click', function() { switchTab(this.dataset.tab); });
     });
 
-    initDropdown('details-batch-dd', function(val) { loadDetailsForBatch(val); });
+    initDropdown('details-batch-dd', function(val) { loadDetailsForBatch(val, true); });
     initDropdown('status-filter-dd', function() { renderBuildsTable(); });
 
     var cfi = el('compare-filter-input');
@@ -908,6 +924,7 @@ document.addEventListener('click', function(e) {
     var action = btn.getAttribute('data-action');
     var id = btn.getAttribute('data-id');
     if (action === 'details') showBuildDetails(id);
+    if (action === 'issues')  showBuildDetails(id);
     if (action === 'log') showBuildLog(id, btn.getAttribute('data-pkg'));
     if (action === 'go-details') navigateToDetails(id);
     if (action === 'go-compare') {
@@ -1044,16 +1061,22 @@ function handleLogSearch() {
 // Browser history
 // ════════════════════════════════════════════════
 
-var _historyInitialised = false;
+var _historyInitialised = true; // replaceState is called at init; all subsequent calls are pushState
 function pushView(state) {
-    if (!_historyInitialised) { _historyInitialised = true; history.replaceState(state, ''); }
-    else history.pushState(state, '');
+    history.pushState(state, '');
 }
 window.addEventListener('popstate', function(e) {
     if (!e.state) return;
     var tab = e.state.tab || 'overview';
     switchTab(tab, false);
-    if (tab === 'details' && e.state.batchId) loadDetailsForBatch(e.state.batchId, false);
+    if (tab === 'details' && e.state.batchId) {
+        loadDetailsForBatch(e.state.batchId, false);
+    }
+    if (tab === 'compare' && e.state.compareIds) {
+        compareSelectedIds = e.state.compareIds.slice();
+        renderCompareBatchList();
+        renderCompareTable();
+    }
 });
 
 // ════════════════════════════════════════════════

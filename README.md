@@ -1,15 +1,25 @@
-# Rebuild Experiments
+# Ubuntu Archive Rebuilder
 
-Runs instrumented Ubuntu archive rebuilds with alternative compilers (Clang or GCC) to produce comparative data for toolchain decisions.
+A tool to rebuild packages from the Ubuntu archive with alternative compilers
+(initially Clang, but designed to be broadly useful for any compiler evaluation).
+It supports adjusting the build environment with global flag overrides — for
+example, forcing DWARF4 debug info for toolchains whose output `dwz` cannot
+yet process.
 
-## Layout
+For each package in a batch the backend will:
 
-```
-profiles/   — compiler profiles (TOML)
-pipeline/   — Rust CLI: fetches sources, drives sbuild, stores results
-viewer/     — static HTML/JS report UI
-tests/      — integration tests
-```
+1. Fetch the source from the Ubuntu archive via `pull-lp-source`.
+2. Run `sbuild --chroot-mode=unshare` with the profile's compiler and flags.
+3. For `clang` profiles, install the target version inside the build environment
+   and replace `/usr/bin/gcc` (and `g++`, `cpp`) with a wrapper script that execs
+   Clang. A verification step confirms `gcc --version` reports Clang before the
+   build starts. This is intentionally direct, because packages can invoke gcc in
+   a number of unexpected ways.
+4. Scan build logs for known error patterns, recording structured findings.
+5. Store results in a local SQLite database.
+
+A static frontend is included for browsing and analysing results.
+
 
 ## Setup
 
@@ -18,14 +28,14 @@ sudo apt install sbuild ubuntu-dev-tools
 sbuild-adduser $USER   # then log out and back in
 ```
 
-The pipeline uses `--chroot-mode=unshare`, so no persistent chroot setup is needed.
+The backend uses `--chroot-mode=unshare`, so no persistent chroot setup is needed.
 
 ## Usage
 
 ```bash
-cd pipeline
+cd backend
 cargo build --release
-BIN=./target/release/rebuild-pipeline
+BIN=./target/release/rebuilder
 
 # Run a batch
 $BIN build --profile ../profiles/clang-18-noble.toml --packages packages-smoke.txt
@@ -33,11 +43,11 @@ $BIN build --profile ../profiles/clang-18-noble.toml --packages packages-smoke.t
 # Check progress
 $BIN status --latest
 
-# Export for the viewer
-$BIN export --output-dir ../viewer/data
+# Export for the frontend
+$BIN export --output-dir ../frontend/data
 
-# Serve the viewer
-python3 -m http.server 8000 --directory ../viewer
+# Serve the frontend
+python3 -m http.server 8000 --directory ../frontend
 ```
 
 ## Profiles
@@ -58,34 +68,10 @@ flag = "-gdwarf-4"
 reason = "Noble's dwz 0.15 doesn't support DWARF5"
 ```
 
-Each `[[flags]]` entry includes a `reason` field to track why the workaround exists. Profiles are snapshotted into the database at build time, so results are always tied to the exact configuration used.
+Each `[[flags]]` entry includes a `reason` field to track why the workaround
+exists. Profiles are snapshotted into the database at build time, so results
+are always tied to the exact configuration used.
 
-| Profile | Description |
-|---|---|
-| `clang-18-noble.toml` | Clang 18, `-gdwarf-4` (dwz workaround) |
-| `clang-18-noble-vanilla.toml` | Clang 18, no extra flags |
-| `gcc-13-noble.toml` | GCC 13 baseline |
-
-## How it works
-
-For each package in a batch the pipeline:
-
-1. Fetches source from the Ubuntu archive via `pull-lp-source`.
-2. Runs `sbuild --chroot-mode=unshare` with the profile's compiler and flags.
-3. For Clang profiles: installs the target Clang version inside the ephemeral chroot and replaces `/usr/bin/gcc` (and `g++`, `cpp`) with thin wrapper scripts that exec Clang. A verification step confirms `gcc --version` reports Clang before the build starts.
-4. For GCC profiles: uses the stock compiler as-is.
-5. Scans failed build logs for ~40 known error patterns (incompatible extensions, inline assembly issues, missing builtins, etc.) and records findings.
-6. Stores everything in a local SQLite database.
-
-## CLI
-
-```
-rebuild-pipeline build   --profile FILE --packages FILE
-                         [--timeout SECS] [-j JOBS] [--run-tests]
-rebuild-pipeline list
-rebuild-pipeline status  [--id ID_OR_NAME | --latest]
-rebuild-pipeline export  --output-dir DIR [--batch ID_OR_NAME]
-```
 
 ## Package list format
 

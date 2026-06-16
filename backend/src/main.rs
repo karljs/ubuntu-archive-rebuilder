@@ -1,8 +1,8 @@
-//! Rebuild Experiments Pipeline — CLI entry point.
+//! Ubuntu Archive Rebuilder — CLI entry point.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rebuild_pipeline::{builder, db, export, profile::Profile};
+use rebuilder::{builder, db, export, profile::Profile};
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -10,13 +10,13 @@ use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(
-    name = "rebuild-pipeline",
-    about = "Ubuntu archive rebuild experiments — build packages with different compilers and analyse results",
+    name = "rebuilder",
+    about = "Ubuntu archive rebuilder — build packages with different compilers and analyse results",
     version
 )]
 struct Cli {
     /// Database file path.
-    #[arg(long, default_value = "rebuild-experiments.db", env = "REBUILD_DB")]
+    #[arg(long, default_value = "rebuilder.db", env = "REBUILD_DB")]
     db: PathBuf,
 
     /// Enable verbose output (includes full sbuild output on stdout).

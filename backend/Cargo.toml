@@ -1,8 +1,8 @@
 [package]
-name = "rebuild-pipeline"
+name = "rebuilder"
 version = "0.1.0"
 edition = "2021"
-description = "Ubuntu archive rebuild experiments - log importer and analyzer"
+description = "Ubuntu archive rebuilder — build packages with different compilers and analyse results"
 
 [dependencies]
 # Async runtime

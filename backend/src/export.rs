@@ -1,12 +1,12 @@
-//! Export module — produces a stripped SQLite database and log files for the viewer.
+//! Export module — produces a stripped SQLite database and log files for the frontend.
 //!
-//! The exported `rebuild.db` contains all batches but with `build_log` columns
+//! The exported `rebuilder.db` contains all batches but with `build_log` columns
 //! nulled out, keeping the file small enough for the browser to load via sql.js.
 //! Build logs are written separately to `logs/<build-id>.log` and fetched on demand.
 //!
 //! The export also materialises a `profile_configs` table derived from the
 //! snapshotted `profile_content` TOML stored in each batch row.  This lets the
-//! viewer treat profile configurations as first-class queryable entities without
+//! frontend treat profile configurations as first-class queryable entities without
 //! parsing TOML in JavaScript.
 
 use anyhow::{Context, Result};
@@ -94,7 +94,7 @@ pub async fn export_data(
 ///
 /// Each row represents one distinct profile (by profile_name).  The flags are
 /// parsed from the snapshotted TOML and reduced to a human-readable summary
-/// and a full JSON representation for the viewer to use without any TOML parsing.
+        /// and a full JSON representation for the frontend to use without any TOML parsing.
 async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS profile_configs (

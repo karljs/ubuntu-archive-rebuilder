@@ -1119,7 +1119,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rebuild-pipeline"
+name = "rebuilder"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run rebuild-pipeline builds across any combination of profiles and package sets.
+# Run rebuilder builds across any combination of profiles and package sets.
 #
 # Discovers profiles automatically from profiles/*.toml. Filters narrow the
 # set before execution. Use --dry-run to see what would run without building.
@@ -14,7 +14,7 @@
 #   --profile GLOB     Only run profiles whose name matches this glob pattern
 #                      May be given multiple times (any match wins)
 #   --jobs N           Parallel make jobs per build (default: CPU count)
-#   --no-export        Skip the viewer export step after all builds finish
+#   --no-export        Skip the frontend export step after all builds finish
 #   --dry-run          Print what would run without executing anything
 #
 # Examples:
@@ -38,9 +38,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PIPELINE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROFILES_DIR="$(cd "$SCRIPT_DIR/../../profiles" && pwd)"
-VIEWER_DIR="$(cd "$SCRIPT_DIR/../../viewer" && pwd)"
+FRONTEND_DIR="$(cd "$SCRIPT_DIR/../../frontend" && pwd)"
 
-CARGO_BIN="$PIPELINE_DIR/target/release/rebuild-pipeline"
+CARGO_BIN="$PIPELINE_DIR/target/release/rebuilder"
 PACKAGES="$PIPELINE_DIR/packages.txt"
 FILTER_SERIES=""
 FILTER_COMPILER=""
@@ -49,7 +49,7 @@ JOBS=""
 DO_EXPORT=1
 DRY_RUN=0
 
-export REBUILD_DB="$PIPELINE_DIR/rebuild-experiments.db"
+export REBUILD_DB="$PIPELINE_DIR/rebuilder.db"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -78,7 +78,7 @@ done
 
 if [[ "$DRY_RUN" -eq 0 && ! -f "$CARGO_BIN" ]]; then
     echo "Pipeline binary not found: $CARGO_BIN" >&2
-    echo "Run: cd pipeline && cargo build --release" >&2
+    echo "Run: cd backend && cargo build --release" >&2
     exit 1
 fi
 
@@ -173,7 +173,7 @@ echo "=== Rebuild matrix ==="
 echo "Profiles:  $PROFILES_DIR"
 echo "Packages:  $PACKAGES ($PKG_COUNT packages)"
 echo "Database:  $REBUILD_DB"
-echo "Viewer:    $VIEWER_DIR/data"
+echo "Frontend:  $FRONTEND_DIR/data"
 [[ -n "$FILTER_SERIES"   ]] && echo "Filter:    series=$FILTER_SERIES"
 [[ -n "$FILTER_COMPILER" ]] && echo "Filter:    compiler=$FILTER_COMPILER"
 for pat in "${FILTER_PROFILES[@]}"; do
@@ -251,8 +251,8 @@ done
 # ---------------------------------------------------------------------------
 
 if [[ "$DO_EXPORT" -eq 1 ]]; then
-    echo "--- Exporting to viewer ---"
-    "$CARGO_BIN" export --output-dir "$VIEWER_DIR/data"
+    echo "--- Exporting to frontend ---"
+    "$CARGO_BIN" export --output-dir "$FRONTEND_DIR/data"
     echo ""
 fi
 

@@ -14,7 +14,7 @@ set -euo pipefail
 CLANG_VERSION="${1:-18}"
 SERIES="${2:-noble}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PIPELINE_SCRIPTS="$SCRIPT_DIR/../pipeline/src/builder/scripts"
+PIPELINE_SCRIPTS="$SCRIPT_DIR/../backend/src/builder/scripts"
 
 # ---------------------------------------------------------------------------
 # Helpers

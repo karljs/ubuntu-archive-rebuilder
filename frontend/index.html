@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rebuild Experiments</title>
+    <title>Ubuntu Archive Rebuilder</title>
     <link rel="stylesheet" href="style.css?v=4">
     <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -15,7 +15,7 @@
 
     <!-- Tab bar -->
     <nav class="tab-bar">
-        <span class="tab-bar-title">Rebuild Experiments</span>
+        <span class="tab-bar-title">Ubuntu Archive Rebuilder</span>
         <button class="tab-btn active" data-tab="overview">Overview</button>
         <button class="tab-btn" data-tab="details">Details</button>
         <button class="tab-btn" data-tab="compare">Compare</button>
@@ -85,7 +85,7 @@
                                 <th data-sort="duration" class="num">Duration</th>
                                 <th data-sort="memory" class="num">Memory</th>
                                 <th data-sort="findings" class="num" title="Build issues detected">Issues</th>
-                                <th class="actions-col">Log</th>
+                                <th class="actions-col"></th>
                             </tr>
                         </thead>
                         <tbody id="builds-tbody"></tbody>
@@ -112,7 +112,7 @@
         <!-- Panel 3: Version context (only shown when siblings across versions exist) -->
         <div id="details-panel-versions" class="details-panel hidden">
             <div class="panel-header">
-                <h2>Version Context</h2>
+                <h2>Success Rate Across Versions</h2>
                 <span id="details-version-context" class="muted"></span>
             </div>
             <div id="details-version-table"></div>

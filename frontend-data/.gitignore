@@ -1,0 +1,4 @@
+# Everything except the stripped frontend database
+*
+!.gitignore
+!rebuild.db

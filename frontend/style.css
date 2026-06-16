@@ -198,20 +198,13 @@ body {
 #details-panel-versions .panel-header { }
 
 #details-version-table { padding: 0.5rem 1rem; }
-#details-version-table table { max-width: 600px; }
+#details-version-table table { max-width: 520px; }
 
-.ver-bar-bg {
-    height: 8px; background: var(--border-light); border-radius: 2px; overflow: hidden; width: 120px;
+/* Clickable rows in version and profile comparison panels */
+.ver-row, .profile-row {
+    cursor: pointer;
 }
-.ver-bar-fill {
-    height: 100%; border-radius: 2px;
-}
-/* Use the same rate color classes for bar fills */
-.ver-bar-fill.rate-green  { background: #1a7f37; }
-.ver-bar-fill.rate-lime   { background: #4a9f57; }
-.ver-bar-fill.rate-yellow { background: #9a6700; }
-.ver-bar-fill.rate-orange { background: #bc4c00; }
-.ver-bar-fill.rate-red    { background: #cf222e; }
+.ver-row:hover, .profile-row:hover { background: #f0f4ff !important; }
 
 /* ════════════════════════════════════════════════
    Status bar (shared)
