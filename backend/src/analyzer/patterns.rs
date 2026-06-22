@@ -34,6 +34,16 @@ pub struct ErrorPattern {
     /// symbols / flags / headers each produce a separate finding (up to the
     /// per-category cap in scan_log).
     pub dedup_by_extracted_key: bool,
+    /// Categories that, if present elsewhere in the same build's findings,
+    /// suppress this finding.  Used to make generic catch-all patterns (e.g.
+    /// LINK_FAILURE) fall back: they are emitted only when no more-specific
+    /// finding explains the failure.  Empty for most patterns.
+    pub suppressed_by: &'static [&'static str],
+    /// Whether this pattern reflects a toolchain (compiler) issue or an
+    /// environmental/infrastructure artifact unrelated to GCC-vs-Clang.
+    /// Defaults conceptually to Toolchain; only a few infra patterns set
+    /// Environmental.
+    pub class: crate::models::FindingClass,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,6 +66,8 @@ const GNU_NESTED_FUNCTIONS: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// GCC extension: variable-length arrays as struct members.
@@ -66,6 +78,8 @@ const GNU_VLA_IN_STRUCT: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// GCC extension: hardware register assignment via `register` keyword.
@@ -76,6 +90,8 @@ const GNU_GLOBAL_REGISTER_VAR: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// GCC extension: `asm goto` — jumps from inline assembly to C labels.
@@ -86,6 +102,8 @@ const GNU_ASM_GOTO: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Inline assembly syntax incompatibilities not covered by ASM_GOTO.
@@ -101,6 +119,8 @@ const GNU_ASM_SYNTAX: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -131,6 +151,8 @@ const IMPLICIT_FUNCTION_DECLARATION: ErrorPattern = ErrorPattern {
         "compiler handles",
     ],
     dedup_by_extracted_key: true, // key = function name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Use of an identifier that has not been declared in scope.
@@ -143,7 +165,10 @@ const UNDECLARED_IDENTIFIER: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &["use of undeclared identifier '__builtin_"],
     dedup_by_extracted_key: true, // key = identifier name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
+
 
 /// Use of an undeclared GCC builtin.
 /// Separate from UNDECLARED_IDENTIFIER because the fix is different
@@ -155,6 +180,8 @@ const MISSING_BUILTIN: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: true, // key = builtin name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,6 +203,8 @@ const CXX11_NARROWING: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// No matching function or constructor for a call.
@@ -190,6 +219,8 @@ const CXX_NO_MATCHING_FUNCTION: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Access to private or protected class members.
@@ -200,6 +231,8 @@ const CXX_ACCESS_VIOLATION: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Code requires C++11 or later but is not being compiled with it.
@@ -213,6 +246,8 @@ const CXX_STD_REQUIREMENT: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Implicit instantiation of an undefined template.
@@ -223,6 +258,8 @@ const CXX_IMPLICIT_INSTANTIATION: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Type redefinition or conflicting type declarations.
@@ -237,6 +274,8 @@ const TYPE_REDEFINITION: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Unknown type name — often caused by a missing typedef or include.
@@ -247,6 +286,69 @@ const UNKNOWN_TYPE_NAME: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: true,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
+};
+
+/// Implicit integer-to-pointer (or pointer-to-integer) conversion.
+/// GCC and older Clang accept this with a warning; Clang 15+ promotes
+/// -Wint-conversion to an error by default, breaking C code that relied on
+/// the laxer behaviour.  Observed: curl (x509asn1.c returning int as char*).
+const CXX_INT_CONVERSION: ErrorPattern = ErrorPattern {
+    key: "CXX_INT_CONVERSION",
+    description: "Implicit integer/pointer conversion rejected (Clang 15+ treats -Wint-conversion as an error)",
+    patterns: &["-Wint-conversion"],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
+};
+
+/// Incompatible function pointer types.  Clang enforces stricter function
+/// pointer type compatibility than GCC and promotes this to an error by
+/// default in recent versions.  Observed: gettext (obstack.c initializing a
+/// noreturn function pointer from a non-noreturn function).
+const INCOMPATIBLE_FUNCTION_POINTER: ErrorPattern = ErrorPattern {
+    key: "INCOMPATIBLE_FUNCTION_POINTER",
+    description: "Incompatible function pointer types (Clang enforces stricter typing than GCC)",
+    patterns: &["-Wincompatible-function-pointer-types"],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
+};
+
+/// Use of the `register` storage-class specifier, removed in C++17.  Clang
+/// rejects it as an error under C++17; GCC only warns.  Per-package source
+/// issue.  Observed: lshw (partitions.cc) across every Clang version/series.
+const CXX17_REGISTER_REMOVED: ErrorPattern = ErrorPattern {
+    key: "CXX17_REGISTER_REMOVED",
+    description: "Use of 'register' storage class specifier, removed in C++17 (Clang errors; GCC warns)",
+    patterns: &[
+        "'register' storage class specifier",
+        "-Wregister",
+    ],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
+};
+
+/// Clang's checked-arithmetic builtins (__builtin_*_overflow) require an
+/// integer type; Clang rejects plain `char`/`bool`/enum operands that GCC
+/// accepted.  Observed: coreutils (lib/posixtm.c).
+const CXX_CHECKED_INT_TYPE: ErrorPattern = ErrorPattern {
+    key: "CXX_CHECKED_INT_TYPE",
+    description: "Checked integer builtin requires a proper integer type (Clang is stricter than GCC)",
+    patterns: &["checked integer operation must be an integer type"],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -277,6 +379,8 @@ const LINK_MISSING_SYMBOL: ErrorPattern = ErrorPattern {
     // not the actual linker error.
     exclude_if_contains: &["libtool:", "gcc -", "g++ -", "clang-", "clang "],
     dedup_by_extracted_key: true, // key = symbol name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Apple Blocks runtime symbols missing.  Packages using Clang Blocks
@@ -288,6 +392,8 @@ const BLOCKS_RUNTIME_MISSING: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Multiple definition of a symbol — usually a header included in multiple TUs
@@ -299,6 +405,8 @@ const LINK_MULTIPLE_DEFINITION: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: true,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Required library not found during linking.
@@ -309,11 +417,21 @@ const LINK_MISSING_LIBRARY: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: true, // key = library name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Generic linker command failure not covered by a more specific category.
 /// Intentionally placed last in the error list so more specific patterns
 /// match first.
+///
+/// This is a catch-all: a failed link almost always also produces a specific
+/// diagnostic (an undefined symbol, a missing library, a multiple definition,
+/// etc.) on a *different* log line.  Since the scanner matches each line
+/// independently, both the specific finding and this generic one would be
+/// recorded for the same failure.  `suppressed_by` drops this finding whenever
+/// a more-specific linker cause is present, so LINK_FAILURE only surfaces when
+/// it is genuinely the only information available.
 const LINK_FAILURE: ErrorPattern = ErrorPattern {
     key: "LINK_FAILURE",
     description: "Linker command failed (see other findings for specific cause)",
@@ -325,6 +443,13 @@ const LINK_FAILURE: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[
+        "LINK_MISSING_SYMBOL",
+        "BLOCKS_RUNTIME_MISSING",
+        "LINK_MULTIPLE_DEFINITION",
+        "LINK_MISSING_LIBRARY",
+    ],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -364,6 +489,28 @@ const LTO_DWARF_MISMATCH: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
+};
+
+/// Clang rejects `-flto=auto`.  GCC and Clang 12+ accept the `auto` argument
+/// to `-flto` (meaning "use $(nproc) link jobs"), but Clang 11 does not — it
+/// errors out.  Ubuntu injects `-flto=auto` into CFLAGS/LDFLAGS for every
+/// package, so on Clang 11 essentially every build fails at the first
+/// compile.  This is the dominant failure cause for the clang-11 batches.
+///
+/// Distinct from UNSUPPORTED_COMPILER_FLAG (which catches "unknown argument"
+/// / "unsupported option"); this is a *valid* flag with an argument value
+/// that this Clang version cannot parse, so it gets its own category.
+const UNSUPPORTED_LTO_AUTO: ErrorPattern = ErrorPattern {
+    key: "UNSUPPORTED_LTO_AUTO",
+    description: "Clang does not accept '-flto=auto' (Clang 11; Ubuntu injects this flag globally)",
+    patterns: &["invalid value 'auto' in '-flto=auto'"],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -378,7 +525,8 @@ const LTO_DWARF_MISMATCH: ErrorPattern = ErrorPattern {
 // ---------------------------------------------------------------------------
 
 /// A compiler flag (non-warning) that Clang does not support.
-/// Observed: libffi (-print-multi-os-directory), ppp (--print-sysroot).
+/// Observed: libffi (-print-multi-os-directory), ppp (--print-sysroot),
+/// gmp (--debug-prefix-map, which Clang spells -fdebug-prefix-map).
 /// Excludes configure probe lines where the failure is expected and handled.
 const UNSUPPORTED_COMPILER_FLAG: ErrorPattern = ErrorPattern {
     key: "UNSUPPORTED_COMPILER_FLAG",
@@ -386,6 +534,9 @@ const UNSUPPORTED_COMPILER_FLAG: ErrorPattern = ErrorPattern {
     patterns: &[
         "unsupported option",
         "unknown argument:",
+        // Clang's "unknown argument '<flag>'; did you mean ...?" form. The flag
+        // name is extracted as the dedup key from the single-quoted token.
+        "unknown argument '",
         "error: unsupported argument",
         "the clang compiler does not support",
     ],
@@ -393,8 +544,26 @@ const UNSUPPORTED_COMPILER_FLAG: ErrorPattern = ErrorPattern {
     // These patterns appear in configure probe output where the error is
     // intentional — autoconf tests flag support by trying it and checking
     // the exit code.
-    exclude_if_contains: &["conftest", "ac_ext", "checking for", "checking whether"],
+    exclude_if_contains: &[
+        "conftest",
+        "ac_ext",
+        "checking for",
+        "checking whether",
+        // Autoconf/libtool compiler-identification probes: it runs the compiler
+        // with each of these version/ident flags to detect the toolchain, and
+        // the "unknown argument" error is expected and ignored.  These are never
+        // a real build failure (every affected build also has a genuine finding).
+        "'-qversion'",
+        "'-version'",
+        "'-V'",
+        "'--version'",
+        "'-qversion;",
+        "'--ec++'",
+        "'--c++'",
+    ],
     dedup_by_extracted_key: true, // key = flag name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -418,6 +587,8 @@ const WERROR_FORMAT_STRING: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Unused-variable/parameter/function warning promoted to error.
@@ -433,6 +604,8 @@ const WERROR_UNUSED: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &["checking whether", "supports compile flag", "compiler handles"],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Any other warning promoted to error via -Werror not covered above.
@@ -447,6 +620,8 @@ const WERROR_OTHER: ErrorPattern = ErrorPattern {
         "-Werror,-Wunused",
     ],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -458,17 +633,46 @@ const WERROR_OTHER: ErrorPattern = ErrorPattern {
 
 /// Configure script cannot create executables with Clang.
 /// Observed: readline, recode — configure's compiler sanity check fails.
+/// Also catches downstream sanity-check failures when the toolchain is broken
+/// (e.g. Clang 11 + -flto=auto): gmp ("could not find a working compiler"),
+/// cmake bootstrap ("Cannot find appropriate C compiler"), zlib
+/// ("reporting is too harsh for ./configure").
 const CONFIGURE_COMPILER_TEST_FAILED: ErrorPattern = ErrorPattern {
     key: "CONFIGURE_COMPILER_TEST_FAILED",
-    description: "Configure script cannot compile a test program with this compiler",
+    description: "Configure/bootstrap cannot compile a test program with this compiler",
     patterns: &[
         "compiler cannot create executables",
         "C compiler cannot create executables",
         "Can't run the compiler",
+        "could not find a working compiler",
+        "Cannot find appropriate C compiler",
+        "reporting is too harsh",
     ],
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
+};
+
+/// CMake feature-detection probe failed.  CMake compiles small programs to
+/// test for language features; under Clang these probes can fail where they
+/// passed under GCC, aborting configuration with "CMake Error".  Distinct from
+/// CXX_STD_REQUIREMENT (an in-source `-std=` requirement message) because the
+/// failure originates in CMake's own feature checks.
+/// Observed: cmake ("The C++ compiler does not support C++11").
+const CMAKE_FEATURE_PROBE_FAILED: ErrorPattern = ErrorPattern {
+    key: "CMAKE_FEATURE_PROBE_FAILED",
+    description: "CMake compiler feature probe failed (a required language feature was not detected under Clang)",
+    patterns: &[
+        "does not support C++11",
+        "compiler does not support C++",
+    ],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Build system (autoconf, cmake, etc.) explicitly rejects Clang or requires GCC.
@@ -487,6 +691,8 @@ const BUILD_SYSTEM_MISDETECTS_COMPILER: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
@@ -511,6 +717,8 @@ const MISSING_HEADER: ErrorPattern = ErrorPattern {
         "conftest",
     ],
     dedup_by_extracted_key: true, // key = header name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// OpenMP not available — Clang requires explicit -fopenmp and the libomp
@@ -526,11 +734,40 @@ const MISSING_OPENMP: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 // ---------------------------------------------------------------------------
 // ── Group 10: Build Infrastructure ───────────────────────────────────────
 // ---------------------------------------------------------------------------
+
+/// Parallel `make install` race condition.  Under high `-j`, multiple `make`
+/// subprocesses invoke `install -d` (or `install -D`) on the same target
+/// directory concurrently; one wins the mkdir and the others fail with
+/// "install: cannot create directory".  Compilation and linking succeed — only
+/// the install phase races.
+///
+/// This is build-infrastructure flakiness, NOT a toolchain incompatibility: it
+/// is unrelated to whether GCC or Clang was used.  Observed on lvm2 and mdadm,
+/// exclusively on the resolute series, under -j parallelism.
+///
+/// The needle is the interleaving-robust substring `cannot create directory`
+/// rather than the full `install: cannot create directory`: under -j the
+/// stderr of several concurrent `install` processes interleaves into forms
+/// like `installinstall: : cannot create directory`, which would not match a
+/// needle containing the `: ` separator.  Error patterns only scan *failed*
+/// builds, so succeeded builds that recovered from the race are unaffected.
+const PARALLEL_INSTALL_RACE: ErrorPattern = ErrorPattern {
+    key: "PARALLEL_INSTALL_RACE",
+    description: "Parallel `make install` race: concurrent `install -d` failed to create a directory (build-infrastructure flakiness, not a toolchain issue)",
+    patterns: &["cannot create directory"],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Environmental,
+};
 
 /// The build process was killed because it exceeded the time limit.
 /// (Also detected by infer_status; recorded as a finding for completeness.)
@@ -541,20 +778,29 @@ const BUILD_TIMEOUT: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// The compiler itself segfaulted — a Clang bug, not a package issue.
+/// Includes hard frontend crashes that abort with a non-zero exit and a
+/// "PLEASE submit a bug report" banner.  Observed: openssl (clang-17 frontend
+/// command failed with exit code 139 — a SIGSEGV).
 const SEGFAULT_IN_COMPILER: ErrorPattern = ErrorPattern {
     key: "SEGFAULT_IN_COMPILER",
-    description: "Compiler process crashed (segmentation fault — likely a Clang bug)",
+    description: "Compiler process crashed (segmentation fault or frontend crash — likely a Clang bug)",
     patterns: &[
         "Segmentation fault (core dumped)",
         "LLVM ERROR: ",
         "clang: error: unable to execute command: Segmentation fault",
+        "frontend command failed with exit code",
+        "PLEASE submit a bug report",
     ],
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// The build process ran out of memory.
@@ -565,6 +811,8 @@ const OUT_OF_MEMORY: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// Library symbol changes detected by dpkg-gensymbols.
@@ -581,6 +829,27 @@ const SYMBOL_ABI_CHANGE: ErrorPattern = ErrorPattern {
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
+};
+
+/// Source package could not be fetched, so no build ever ran.  `pull-lp-source`
+/// failed (missing/unverifiable signing key, network, or archive issue).  This
+/// is NOT a toolchain result — it is an infrastructure/setup failure and should
+/// be excluded from compiler-comparison analysis.  Observed: attr ("Public key
+/// not found, could not verify signature").
+const SOURCE_FETCH_FAILED: ErrorPattern = ErrorPattern {
+    key: "SOURCE_FETCH_FAILED",
+    description: "Source fetch failed before the build started (pull-lp-source error; not a toolchain result)",
+    patterns: &[
+        "pull-lp-source failed",
+        "Public key not found, could not verify signature",
+    ],
+    require_prefix: None,
+    exclude_if_contains: &[],
+    dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Environmental,
 };
 
 // ===========================================================================
@@ -611,11 +880,17 @@ pub static ERROR_PATTERNS: &[&ErrorPattern] = &[
     &CXX_IMPLICIT_INSTANTIATION,
     &TYPE_REDEFINITION,
     &UNKNOWN_TYPE_NAME,
+    &CXX_INT_CONVERSION,
+    &INCOMPATIBLE_FUNCTION_POINTER,
+    &CXX17_REGISTER_REMOVED,
+    &CXX_CHECKED_INT_TYPE,
     // Linker — specific causes before generic failure
     &LINK_MISSING_SYMBOL,
     &LINK_MULTIPLE_DEFINITION,
     &LINK_MISSING_LIBRARY,
     &LINK_FAILURE,             // catch-all, last among linker patterns
+    // LTO argument unsupported by this Clang (before generic flag pattern)
+    &UNSUPPORTED_LTO_AUTO,
     // Compiler flags
     &UNSUPPORTED_COMPILER_FLAG,
     // -Werror promotions
@@ -624,11 +899,14 @@ pub static ERROR_PATTERNS: &[&ErrorPattern] = &[
     &WERROR_OTHER,
     // Build system
     &CONFIGURE_COMPILER_TEST_FAILED,
+    &CMAKE_FEATURE_PROBE_FAILED,
     &BUILD_SYSTEM_MISDETECTS_COMPILER,
     // Missing deps — MISSING_OPENMP before MISSING_HEADER (more specific)
     &MISSING_OPENMP,
     &MISSING_HEADER,
     // Infrastructure
+    &SOURCE_FETCH_FAILED,
+    &PARALLEL_INSTALL_RACE,
     &BUILD_TIMEOUT,
     &SEGFAULT_IN_COMPILER,
     &OUT_OF_MEMORY,
@@ -648,17 +926,25 @@ pub static ERROR_PATTERNS: &[&ErrorPattern] = &[
 /// LTO model) and silently ignores this flag with a warning.  Packages still
 /// build successfully, but the flag is not having its intended effect.
 ///
-/// Observed on 68 packages across all series/profiles in current data.
 /// The appropriate response is a global profile flag to suppress the warning,
 /// or an Ubuntu infrastructure change to strip -ffat-lto-objects when building
 /// with Clang.
+///
+/// IMPORTANT: the only reliable signal is Clang's warning, identified by the
+/// `-Wignored-optimization-argument` diagnostic name.  Matching on the bare
+/// `-ffat-lto-objects` string is wrong: that flag appears verbatim on every
+/// compile/configure command line (Ubuntu injects it into CFLAGS/LDFLAGS for
+/// every package), so it fires on essentially every successful build —
+/// including GCC builds, which fully support the flag and never ignore it.
 const LTO_FAT_OBJECTS_IGNORED: ErrorPattern = ErrorPattern {
     key: "LTO_FAT_OBJECTS_IGNORED",
     description: "Ubuntu's -ffat-lto-objects flag is silently ignored by Clang (different LTO model)",
-    patterns: &["ignored-optimization-argument", "-ffat-lto-objects"],
+    patterns: &["ignored-optimization-argument"],
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 /// A GCC-specific warning flag (-Wlogical-op, -Wsync-nand, etc.) that Clang
@@ -674,6 +960,8 @@ const UNKNOWN_WARNING_FLAG: ErrorPattern = ErrorPattern {
     // Exclude configure probe lines that intentionally test for flag support.
     exclude_if_contains: &["checking whether", "supports compile flag", "compiler handles"],
     dedup_by_extracted_key: true, // key = flag name
+    suppressed_by: &[],
+    class: crate::models::FindingClass::Toolchain,
 };
 
 pub static OBSERVATION_PATTERNS: &[&ErrorPattern] = &[
@@ -802,6 +1090,20 @@ mod tests {
     }
 
     #[test]
+    fn lto_fat_objects_does_not_match_plain_command_line() {
+        // A plain compile command line carries -ffat-lto-objects (Ubuntu injects
+        // it into CFLAGS for every package).  This is NOT an "ignored flag"
+        // warning and must not produce a finding — neither for GCC nor Clang.
+        let gcc_line = "gcc -DHAVE_CONFIG_H -I. -g -O2 -flto=auto -ffat-lto-objects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -c -o foo.o foo.c";
+        assert!(match_obs(gcc_line).is_none());
+        assert!(match_error(gcc_line).is_none());
+
+        let clang_line = "clang -DHAVE_CONFIG_H -I. -g -O2 -flto=auto -ffat-lto-objects -fstack-protector-strong -c -o foo.o foo.c";
+        assert!(match_obs(clang_line).is_none());
+        assert!(match_error(clang_line).is_none());
+    }
+
+    #[test]
     fn unknown_warning_flag_is_observation() {
         let line = "warning: unknown warning option '-Wlogical-op'; did you mean '-Wlong-long'?";
         assert!(match_error(line).is_none());
@@ -815,5 +1117,101 @@ mod tests {
         let p = match_error("error: constant expression evaluates to 18446744073709551615 which cannot be narrowed to type 'int64_t' [-Wc++11-narrowing]");
         assert!(p.is_some());
         assert_eq!(p.unwrap().key, "CXX11_NARROWING");
+    }
+
+    #[test]
+    fn parallel_install_race() {
+        let p = match_error("install: cannot create directory '/build/x/usr/lib/udev/rules.d'");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "PARALLEL_INSTALL_RACE");
+    }
+
+    #[test]
+    fn parallel_install_race_interleaved() {
+        // Under -j the install stderr interleaves; the colon-separated form is
+        // mangled but `cannot create directory` survives and must still match.
+        let p = match_error("installinstallinstall: : : cannot create directory '/build/x/usr/lib/x86_64-linux-gnu/device-mapper'");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "PARALLEL_INSTALL_RACE");
+    }
+
+    #[test]
+    fn unsupported_lto_auto() {
+        let p = match_error("error: invalid value 'auto' in '-flto=auto'");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "UNSUPPORTED_LTO_AUTO");
+    }
+
+    #[test]
+    fn cxx17_register_removed() {
+        let p = match_error("partitions.cc:631:3: error: ISO C++17 does not allow 'register' storage class specifier [-Wregister]");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "CXX17_REGISTER_REMOVED");
+    }
+
+    #[test]
+    fn int_conversion() {
+        let p = match_error("vtls/x509asn1.c:569:14: error: incompatible integer to pointer conversion returning 'int' from a function with result type 'const char *' [-Wint-conversion]");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "CXX_INT_CONVERSION");
+    }
+
+    #[test]
+    fn incompatible_function_pointer() {
+        let p = match_error("obstack.c:351:31: error: incompatible function pointer types initializing 'void (*)(void)' [-Wincompatible-function-pointer-types]");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "INCOMPATIBLE_FUNCTION_POINTER");
+    }
+
+    #[test]
+    fn checked_int_type() {
+        let p = match_error("lib/posixtm.c:194:15: error: operand argument to checked integer operation must be an integer type other than plain 'char', 'bool', bit-precise, or an enumeration ('bool' invalid)");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "CXX_CHECKED_INT_TYPE");
+    }
+
+    #[test]
+    fn unknown_argument_double_dash_flag() {
+        // gmp: GCC-style --debug-prefix-map rejected by Clang. The flag name is
+        // extracted as the dedup key.
+        let p = match_error("clang-18: error: unknown argument '--debug-prefix-map=/build/x=.'; did you mean '-fdebug-prefix-map=/build/x=.'?");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "UNSUPPORTED_COMPILER_FLAG");
+    }
+
+    #[test]
+    fn lto_auto_before_unsupported_flag() {
+        // The -flto=auto error must classify as UNSUPPORTED_LTO_AUTO, not the
+        // generic UNSUPPORTED_COMPILER_FLAG.
+        let p = match_error("error: invalid value 'auto' in '-flto=auto'");
+        assert_eq!(p.unwrap().key, "UNSUPPORTED_LTO_AUTO");
+    }
+
+    #[test]
+    fn cmake_feature_probe_failed() {
+        let p = match_error("  The C++ compiler does not support C++11 (e.g.  std::unique_ptr).");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "CMAKE_FEATURE_PROBE_FAILED");
+    }
+
+    #[test]
+    fn configure_working_compiler() {
+        let p = match_error("configure: error: could not find a working compiler, see config.log for details");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "CONFIGURE_COMPILER_TEST_FAILED");
+    }
+
+    #[test]
+    fn segfault_frontend_crash() {
+        let p = match_error("clang-17: error: clang frontend command failed with exit code 139 (use -v to see invocation)");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "SEGFAULT_IN_COMPILER");
+    }
+
+    #[test]
+    fn source_fetch_failed() {
+        let p = match_error("Build failed to execute: pull-lp-source failed for attr in noble: Public key not found, could not verify signature");
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().key, "SOURCE_FETCH_FAILED");
     }
 }

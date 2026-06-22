@@ -77,6 +77,16 @@ enum Commands {
         #[arg(long)]
         batch: Option<String>,
     },
+
+    /// Re-derive findings for all builds by re-scanning their stored build logs.
+    ///
+    /// Deletes existing findings and regenerates them with the current analyzer
+    /// patterns. Useful after fixing or adding error/observation patterns.
+    Rescan {
+        /// Re-scan every build in the database.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[tokio::main]
@@ -187,6 +197,9 @@ async fn main() -> Result<()> {
             println!("  Total: {}", stats.total);
             println!("  Succeeded: {} ({:.1}%)", stats.succeeded, stats.percent(stats.succeeded));
             println!("  Failed: {} ({:.1}%)", stats.failed, stats.percent(stats.failed));
+            if stats.environmental > 0 {
+                println!("  Environmental (excluded): {}", stats.environmental);
+            }
             println!("  Dep-wait: {}", stats.dep_wait);
             println!("  Timeout: {}", stats.timeout);
 
@@ -214,6 +227,53 @@ async fn main() -> Result<()> {
             export::export_data(&pool, &output_dir, batch_filter.as_deref()).await?;
             info!(output_dir = %output_dir.display(), "Export complete");
             println!("Exported data to {}", output_dir.display());
+        }
+
+        Commands::Rescan { all } => {
+            if !all {
+                bail!("rescan requires --all");
+            }
+
+            let builds = db::list_all_builds(&pool).await?;
+            info!(builds = builds.len(), "Re-scanning build logs");
+
+            let mut scanned = 0usize;
+            let mut skipped = 0usize;
+            let mut findings_before = 0u64;
+            let mut findings_after = 0u64;
+
+            for build in &builds {
+                let Some(log) = build.build_log.as_deref().filter(|l| !l.is_empty()) else {
+                    skipped += 1;
+                    continue;
+                };
+
+                findings_before += db::delete_findings_for_build(&pool, build.id).await?;
+
+                let findings = rebuilder::analyzer::scan_log(log, build.status);
+                for finding in &findings {
+                    db::insert_finding(
+                        &pool,
+                        build.id,
+                        &finding.category,
+                        &finding.description,
+                        &finding.excerpt,
+                        Some(finding.line_number as i64),
+                        finding.severity,
+                        finding.class,
+                    )
+                    .await?;
+                }
+                findings_after += findings.len() as u64;
+                scanned += 1;
+            }
+
+            println!();
+            println!("Rescan complete:");
+            println!("  Builds scanned: {scanned}");
+            println!("  Builds skipped (no log): {skipped}");
+            println!("  Findings before: {findings_before}");
+            println!("  Findings after:  {findings_after}");
         }
     }
 

@@ -20,8 +20,7 @@ mod patterns;
 
 pub use patterns::{match_pattern, ErrorPattern, ERROR_PATTERNS, OBSERVATION_PATTERNS};
 
-use crate::models::{BuildStatus, FindingSeverity};
-
+use crate::models::{BuildStatus, FindingClass, FindingSeverity};
 /// Maximum number of distinct findings per category before a summary is emitted.
 const MAX_FINDINGS_PER_CATEGORY: usize = 5;
 
@@ -38,6 +37,8 @@ pub struct Finding {
     pub line_number: usize,
     /// Severity: error (failed build) or observation (succeeded build).
     pub severity: FindingSeverity,
+    /// Toolchain vs environmental classification (from the matched pattern).
+    pub class: FindingClass,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,7 @@ fn scan(log: &str, patterns: &[&ErrorPattern], severity: FindingSeverity) -> Vec
             excerpt,
             line_number: idx + 1,
             severity,
+            class: pattern.class,
         });
     }
 
@@ -130,12 +132,12 @@ fn scan(log: &str, patterns: &[&ErrorPattern], severity: FindingSeverity) -> Vec
     for (category, count) in &category_counts {
         if *count > MAX_FINDINGS_PER_CATEGORY {
             let overflow = count - MAX_FINDINGS_PER_CATEGORY;
-            // Find the pattern to get the base description.
-            let base_desc = patterns
-                .iter()
-                .find(|p| p.key == category.as_str())
-                .map(|p| p.description)
-                .unwrap_or("additional occurrences");
+            // Find the pattern to get the base description and class.
+            let pattern = patterns.iter().find(|p| p.key == category.as_str());
+            let base_desc = pattern.map(|p| p.description).unwrap_or("additional occurrences");
+            let class = pattern
+                .map(|p| p.class)
+                .unwrap_or(FindingClass::Toolchain);
             findings.push(Finding {
                 category: category.clone(),
                 description: format!(
@@ -147,9 +149,25 @@ fn scan(log: &str, patterns: &[&ErrorPattern], severity: FindingSeverity) -> Vec
                 excerpt: String::new(),
                 line_number: 0,
                 severity,
+                class,
             });
         }
     }
+
+    // Suppression pass: drop catch-all findings when a more-specific finding
+    // (listed in the pattern's `suppressed_by`) is also present.  This lets
+    // generic patterns like LINK_FAILURE fall back — they only surface when no
+    // specific cause explains the failure.
+    let present: std::collections::HashSet<String> =
+        findings.iter().map(|f| f.category.clone()).collect();
+    findings.retain(|f| {
+        let suppressed_by = patterns
+            .iter()
+            .find(|p| p.key == f.category)
+            .map(|p| p.suppressed_by)
+            .unwrap_or(&[]);
+        !suppressed_by.iter().any(|c| present.contains(*c))
+    });
 
     findings
 }
@@ -284,6 +302,41 @@ mod tests {
     }
 
     #[test]
+    fn fat_lto_command_lines_produce_no_observation() {
+        // A successful build log full of compile command lines carrying
+        // -ffat-lto-objects (as every Ubuntu build has) must NOT yield any
+        // LTO_FAT_OBJECTS_IGNORED observation.  Only the genuine Clang
+        // "-Wignored-optimization-argument" warning counts.
+        let log = "gcc -g -O2 -flto=auto -ffat-lto-objects -c -o a.o a.c\n\
+                   gcc -g -O2 -flto=auto -ffat-lto-objects -c -o b.o b.c\n\
+                   Build finished successfully";
+        let findings = scan_log(log, BuildStatus::Succeeded);
+        assert!(
+            findings.iter().all(|f| f.category != "LTO_FAT_OBJECTS_IGNORED"),
+            "command-line occurrences of -ffat-lto-objects must not produce findings"
+        );
+    }
+
+    #[test]
+    fn environmental_class_assigned_to_install_race() {
+        use crate::models::FindingClass;
+        let log = "install: cannot create directory '/build/x/usr/lib/udev/rules.d'\n\
+                   make[3]: *** [Makefile:63: 55-dm_install] Error 1";
+        let findings = scan_log(log, BuildStatus::Failed);
+        let race = findings.iter().find(|f| f.category == "PARALLEL_INSTALL_RACE").unwrap();
+        assert_eq!(race.class, FindingClass::Environmental);
+    }
+
+    #[test]
+    fn toolchain_class_assigned_to_compiler_error() {
+        use crate::models::FindingClass;
+        let log = "bogl-font.c:84:3: error: function definition is not allowed here";
+        let findings = scan_log(log, BuildStatus::Failed);
+        let f = findings.iter().find(|f| f.category == "GNU_NESTED_FUNCTIONS").unwrap();
+        assert_eq!(f.class, FindingClass::Toolchain);
+    }
+
+    #[test]
     fn no_findings_on_depwait() {
         let log = "unsatisfiable build-dependencies for package";
         let findings = scan_log(log, BuildStatus::DepWait);
@@ -319,6 +372,50 @@ mod tests {
             .collect();
         // All three symbols are distinct, should each produce a finding.
         assert_eq!(link_findings.len(), 3);
+    }
+
+    #[test]
+    fn link_failure_suppressed_when_specific_cause_present() {
+        // A real link failure produces both an undefined-symbol line and a
+        // generic "ld returned 1 exit status" line.  Only the specific cause
+        // (LINK_MISSING_SYMBOL) should survive; the generic LINK_FAILURE is
+        // suppressed.
+        let log = "process.c:6500: undefined reference to `crypt'\n\
+                   collect2: error: ld returned 1 exit status\n\
+                   make[2]: *** [Makefile:79: screen] Error 1";
+        let findings = scan_log(log, BuildStatus::Failed);
+        assert!(
+            findings.iter().any(|f| f.category == "LINK_MISSING_SYMBOL"),
+            "specific link cause must be present"
+        );
+        assert!(
+            findings.iter().all(|f| f.category != "LINK_FAILURE"),
+            "generic LINK_FAILURE must be suppressed when a specific cause exists"
+        );
+    }
+
+    #[test]
+    fn link_failure_kept_when_no_specific_cause() {
+        // A bare linker failure with no more-specific diagnostic must still be
+        // reported via LINK_FAILURE.
+        let log = "collect2: error: ld returned 1 exit status\n\
+                   make[2]: *** [Makefile:79: thing] Error 1";
+        let findings = scan_log(log, BuildStatus::Failed);
+        assert!(
+            findings.iter().any(|f| f.category == "LINK_FAILURE"),
+            "LINK_FAILURE must be kept when it is the only link finding"
+        );
+    }
+
+    #[test]
+    fn parallel_install_race_is_categorised() {
+        let log = "install: cannot create directory '/build/x/usr/lib/udev/rules.d'\n\
+                   make[3]: *** [Makefile:63: 55-dm_install] Error 1";
+        let findings = scan_log(log, BuildStatus::Failed);
+        assert!(
+            findings.iter().any(|f| f.category == "PARALLEL_INSTALL_RACE"),
+            "install-directory race must be categorised"
+        );
     }
 
     #[test]

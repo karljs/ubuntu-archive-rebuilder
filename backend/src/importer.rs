@@ -177,6 +177,7 @@ async fn import_single_log(
                 &finding.excerpt,
                 Some(finding.line_number as i64),
                 finding.severity,
+                finding.class,
             )
             .await?;
         }

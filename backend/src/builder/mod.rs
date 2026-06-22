@@ -203,6 +203,7 @@ async fn store_build_result(
                 &finding.excerpt,
                 Some(finding.line_number as i64),
                 finding.severity,
+                finding.class,
             )
             .await?;
         }

@@ -1,6 +1,6 @@
 //! Database operations — SQLite storage for batches, builds, and findings.
 
-use crate::models::{BuildStatus, BuilderBackend, FindingSeverity};
+use crate::models::{BuildStatus, BuilderBackend, FindingClass, FindingSeverity};
 pub use crate::models::{Batch, Build, BuildFinding};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
@@ -12,8 +12,16 @@ use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_findings_severity.sql");
+const MIGRATION_003: &str = include_str!("../migrations/003_findings_class.sql");
 
 /// Aggregate build counts for a batch.
+///
+/// `environmental` holds builds that failed *only* because of environmental /
+/// infrastructure findings (e.g. a parallel-install race), not the toolchain.
+/// These are split out of `failed` so they don't count against the compiler in
+/// success-rate comparisons. `total` still counts every build, but
+/// `comparable_total()` / `toolchain_success_rate()` exclude environmental
+/// failures.
 #[derive(Debug, Default)]
 pub struct BatchStats {
     pub total: i64,
@@ -23,6 +31,9 @@ pub struct BatchStats {
     pub failed: i64,
     pub dep_wait: i64,
     pub timeout: i64,
+    /// Failed builds whose findings were all environmental (excluded from
+    /// compiler comparison). Subset carved out of what would otherwise be `failed`.
+    pub environmental: i64,
 }
 
 impl BatchStats {
@@ -33,6 +44,12 @@ impl BatchStats {
         } else {
             (part as f64 / self.total as f64) * 100.0
         }
+    }
+
+    /// Total builds excluding environmental-only failures — the denominator for
+    /// a fair compiler comparison.
+    pub fn comparable_total(&self) -> i64 {
+        self.total - self.environmental
     }
 }
 
@@ -90,6 +107,20 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .execute(&pool)
             .await
             .context("Failed to apply migration 002")?;
+    }
+
+    let has_class: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('build_findings') WHERE name = 'finding_class'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(false);
+
+    if !has_class {
+        sqlx::query(MIGRATION_003)
+            .execute(&pool)
+            .await
+            .context("Failed to apply migration 003")?;
     }
 
     Ok(pool)
@@ -298,6 +329,22 @@ pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<V
     .collect()
 }
 
+/// Fetch all builds across all batches, ordered by submission time.
+pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
+    sqlx::query(
+        "SELECT id, batch_id, source_package, version, status,
+                build_duration_seconds, peak_memory_mb,
+                build_log, compiler_detected, submitted_at, completed_at
+         FROM builds ORDER BY submitted_at",
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list all builds")?
+    .iter()
+    .map(build_from_row)
+    .collect()
+}
+
 fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
     let id_str: String = row.get("id");
     let batch_id_str: String = row.get("batch_id");
@@ -337,12 +384,13 @@ pub async fn insert_finding(
     excerpt: &str,
     line_number: Option<i64>,
     severity: FindingSeverity,
+    class: FindingClass,
 ) -> Result<BuildFinding> {
     let id = Uuid::new_v4();
 
     sqlx::query(
-        "INSERT INTO build_findings (id, build_id, category, description, excerpt, line_number, severity)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO build_findings (id, build_id, category, description, excerpt, line_number, severity, finding_class)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(build_id.to_string())
@@ -351,6 +399,7 @@ pub async fn insert_finding(
     .bind(excerpt)
     .bind(line_number)
     .bind(severity.as_str())
+    .bind(class.as_str())
     .execute(pool)
     .await
     .context("Failed to insert finding")?;
@@ -363,6 +412,7 @@ pub async fn insert_finding(
         excerpt: excerpt.to_string(),
         line_number,
         severity,
+        class,
     })
 }
 
@@ -372,7 +422,7 @@ pub async fn get_findings_for_build(
     build_id: Uuid,
 ) -> Result<Vec<BuildFinding>> {
     sqlx::query(
-        "SELECT id, build_id, category, description, excerpt, line_number, severity
+        "SELECT id, build_id, category, description, excerpt, line_number, severity, finding_class
          FROM build_findings WHERE build_id = ? ORDER BY line_number",
     )
     .bind(build_id.to_string())
@@ -394,10 +444,21 @@ pub async fn get_finding_count_for_build(pool: &SqlitePool, build_id: Uuid) -> R
     Ok(row.get("count"))
 }
 
+/// Delete all findings for a build. Returns the number of rows removed.
+pub async fn delete_findings_for_build(pool: &SqlitePool, build_id: Uuid) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM build_findings WHERE build_id = ?")
+        .bind(build_id.to_string())
+        .execute(pool)
+        .await
+        .context("Failed to delete findings")?;
+    Ok(result.rows_affected())
+}
+
 fn finding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BuildFinding> {
     let id_str: String = row.get("id");
     let build_id_str: String = row.get("build_id");
     let severity_str: String = row.get("severity");
+    let class_str: String = row.get("finding_class");
 
     Ok(BuildFinding {
         id: Uuid::parse_str(&id_str)?,
@@ -407,6 +468,9 @@ fn finding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BuildFinding> {
         excerpt: row.get("excerpt"),
         line_number: row.get("line_number"),
         severity: severity_str
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))?,
+        class: class_str
             .parse()
             .map_err(|e: String| anyhow::anyhow!(e))?,
     })
@@ -442,6 +506,27 @@ pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchS
     }
     stats.total = stats.pending + stats.building + stats.succeeded
         + stats.failed + stats.dep_wait + stats.timeout;
+
+    // Carve out "environmental" failures: failed builds that have at least one
+    // finding and whose findings are *all* environmental. These are infra
+    // artifacts (e.g. parallel-install races), not toolchain failures, so they
+    // are split out of `failed` and excluded from compiler comparison.
+    let env_failures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM builds b
+         WHERE b.batch_id = ? AND b.status = 'failed'
+           AND EXISTS (SELECT 1 FROM build_findings f WHERE f.build_id = b.id)
+           AND NOT EXISTS (
+               SELECT 1 FROM build_findings f
+               WHERE f.build_id = b.id AND f.finding_class <> 'environmental'
+           )",
+    )
+    .bind(batch_id.to_string())
+    .fetch_one(pool)
+    .await
+    .context("Failed to count environmental failures")?;
+
+    stats.environmental = env_failures;
+    stats.failed -= env_failures;
 
     Ok(stats)
 }
