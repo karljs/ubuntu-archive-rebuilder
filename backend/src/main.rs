@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rebuilder::{builder, db, export, fetcher, profile::Profile};
+use rebuilder::{builder, db, export, fetcher, models::StoreLogs, profile::Profile};
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -50,6 +50,19 @@ enum Commands {
         /// Run package test suites (default: skip tests).
         #[arg(long, default_value = "false")]
         run_tests: bool,
+
+        /// Log storage policy:
+        ///   all      — compress and store every build log (default).
+        ///   failures — store only failed/timeout/dep_wait logs; succeeded logs
+        ///              are scanned for findings then discarded.
+        ///   none     — scan for findings then discard all logs.
+        #[arg(long, default_value = "all")]
+        store_logs: StoreLogs,
+
+        /// Base directory for downloaded source packages.
+        /// Defaults to /var/tmp/rebuild-source (real disk, not RAM tmpfs).
+        #[arg(long, default_value = "/var/tmp/rebuild-source")]
+        source_dir: PathBuf,
     },
 
     /// List all batches.
@@ -149,6 +162,8 @@ async fn main() -> Result<()> {
             timeout,
             jobs,
             run_tests,
+            store_logs,
+            source_dir,
         } => {
             let profile = Profile::load(&profile_path)?;
             profile.validate_series_available()?;
@@ -181,6 +196,8 @@ async fn main() -> Result<()> {
                 verbose: cli.verbose,
                 run_tests,
                 jobs,
+                store_logs,
+                source_dir,
             };
 
             let (batch_id, stats) = builder::run_batch(&pool, &config).await?;
@@ -281,14 +298,20 @@ async fn main() -> Result<()> {
             let mut findings_after = 0u64;
 
             for build in &builds {
-                let Some(log) = build.build_log.as_deref().filter(|l| !l.is_empty()) else {
+                // Fetch the log separately — list_all_builds intentionally
+                // omits log content to avoid loading gigabytes into memory.
+                let Some(log) = db::get_build_log(&pool, build.id).await? else {
                     skipped += 1;
                     continue;
                 };
+                if log.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
 
                 findings_before += db::delete_findings_for_build(&pool, build.id).await?;
 
-                let findings = rebuilder::analyzer::scan_log(log, build.status);
+                let findings = rebuilder::analyzer::scan_log(&log, build.status);
                 for finding in &findings {
                     db::insert_finding(
                         &pool,

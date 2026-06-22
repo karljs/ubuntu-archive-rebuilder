@@ -246,6 +246,43 @@ pub struct BuildResult {
     pub compiler_detected: Option<String>,
 }
 
+/// How build logs are stored.
+///
+/// `All`      — compress and store every log (default, backward-compatible).
+/// `Failures` — compress and store only failed/timeout/dep_wait builds;
+///              succeeded build logs are scanned for observations then dropped.
+/// `None`     — scan for findings then drop all logs; nothing stored in the DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoreLogs {
+    #[default]
+    All,
+    Failures,
+    None,
+}
+
+impl std::str::FromStr for StoreLogs {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(Self::All),
+            "failures" => Ok(Self::Failures),
+            "none" => Ok(Self::None),
+            other => Err(format!("unknown store-logs value '{other}': expected all, failures, or none")),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreLogs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => f.write_str("all"),
+            Self::Failures => f.write_str("failures"),
+            Self::None => f.write_str("none"),
+        }
+    }
+}
+
 /// Resource usage metrics parsed from `/usr/bin/time -v` output.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceMetrics {

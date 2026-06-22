@@ -5,14 +5,17 @@ pub use crate::models::{Batch, Build, BuildFinding};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use flate2::read::GzDecoder;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
+use std::io::Read;
 use std::path::Path;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_findings_severity.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_findings_class.sql");
+const MIGRATION_004: &str = include_str!("../migrations/004_build_log_blob.sql");
 
 /// Aggregate build counts for a batch.
 ///
@@ -60,6 +63,10 @@ impl BatchStats {
 /// functions is a separate struct for the same reason: sqlx rows yield owned
 /// `String` values, so the two types serve different lifetimes and cannot
 /// easily be unified without unnecessary allocations.
+///
+/// `build_log` is gzip-compressed bytes.  `None` means the log was not stored
+/// (dropped by the store-logs policy).  The encoding is always gzip; there is
+/// no plain-text path for new rows.
 pub struct NewBuild<'a> {
     pub batch_id: Uuid,
     pub source_package: &'a str,
@@ -67,7 +74,7 @@ pub struct NewBuild<'a> {
     pub status: BuildStatus,
     pub build_duration_seconds: Option<f64>,
     pub peak_memory_mb: Option<i64>,
-    pub build_log: Option<&'a str>,
+    pub build_log: Option<Vec<u8>>,
     pub compiler_detected: Option<&'a str>,
     pub submitted_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -121,6 +128,24 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .execute(&pool)
             .await
             .context("Failed to apply migration 003")?;
+    }
+
+    // Migration 004: reshape builds.build_log from TEXT to BLOB (gzip).
+    // Detect by checking whether the column type has changed; we use the
+    // presence of the new BLOB affinity as a proxy — if the column type is
+    // still 'TEXT' the migration has not been applied yet.
+    let log_col_type: Option<String> = sqlx::query_scalar(
+        "SELECT type FROM pragma_table_info('builds') WHERE name = 'build_log'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap_or(None);
+
+    if log_col_type.as_deref() != Some("BLOB") {
+        sqlx::query(MIGRATION_004)
+            .execute(&pool)
+            .await
+            .context("Failed to apply migration 004")?;
     }
 
     Ok(pool)
@@ -289,7 +314,7 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
     .bind(b.status.as_str())
     .bind(b.build_duration_seconds)
     .bind(b.peak_memory_mb)
-    .bind(b.build_log)
+    .bind(b.build_log.as_deref())   // Option<&[u8]> — NULL when not stored
     .bind(b.compiler_detected)
     .bind(b.submitted_at.to_rfc3339())
     .bind(b.completed_at.map(|d| d.to_rfc3339()))
@@ -305,19 +330,20 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         status: b.status,
         build_duration_seconds: b.build_duration_seconds,
         peak_memory_mb: b.peak_memory_mb,
-        build_log: b.build_log.map(|s| s.to_string()),
+        build_log: None,   // never populated on insert path; use get_build_log()
         compiler_detected: b.compiler_detected.map(|s| s.to_string()),
         submitted_at: b.submitted_at,
         completed_at: b.completed_at,
     })
 }
 
-/// Get all builds for a batch.
+/// Get all builds for a batch.  The `build_log` field is always `None` here;
+/// use `get_build_log()` when the log content is actually needed.
 pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
                 build_duration_seconds, peak_memory_mb,
-                build_log, compiler_detected, submitted_at, completed_at
+                compiler_detected, submitted_at, completed_at
          FROM builds WHERE batch_id = ? ORDER BY submitted_at",
     )
     .bind(batch_id.to_string())
@@ -330,11 +356,12 @@ pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<V
 }
 
 /// Fetch all builds across all batches, ordered by submission time.
+/// The `build_log` field is always `None`; use `get_build_log()` when needed.
 pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
                 build_duration_seconds, peak_memory_mb,
-                build_log, compiler_detected, submitted_at, completed_at
+                compiler_detected, submitted_at, completed_at
          FROM builds ORDER BY submitted_at",
     )
     .fetch_all(pool)
@@ -343,6 +370,36 @@ pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
     .iter()
     .map(build_from_row)
     .collect()
+}
+
+/// Fetch and decompress the build log for a single build.
+///
+/// Returns `None` if no log was stored (dropped by store policy).
+/// The stored blob is always gzip-compressed; legacy plain-text rows written
+/// before migration 004 are handled by falling back to UTF-8 interpretation
+/// if gzip decompression fails.
+pub async fn get_build_log(pool: &SqlitePool, build_id: Uuid) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT build_log FROM builds WHERE id = ?",
+    )
+    .bind(build_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .context("Failed to fetch build log")?;
+
+    let Some(row) = row else { return Ok(None) };
+    let blob: Option<Vec<u8>> = row.get("build_log");
+    let Some(bytes) = blob else { return Ok(None) };
+
+    // Try gzip first; fall back to plain UTF-8 for any pre-migration rows that
+    // were not compressed by the one-time migration script.
+    let mut gz = GzDecoder::new(&bytes[..]);
+    let mut s = String::new();
+    if gz.read_to_string(&mut s).is_ok() {
+        Ok(Some(s))
+    } else {
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
 }
 
 fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
@@ -362,7 +419,7 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
             .map_err(|e: String| anyhow::anyhow!(e))?,
         build_duration_seconds: row.get("build_duration_seconds"),
         peak_memory_mb: row.get("peak_memory_mb"),
-        build_log: row.get("build_log"),
+        build_log: None,   // not selected; use get_build_log() when needed
         compiler_detected: row.get("compiler_detected"),
         submitted_at: DateTime::parse_from_rfc3339(&submitted_str)?.with_timezone(&Utc),
         completed_at: completed_str
@@ -530,7 +587,6 @@ pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchS
 
     Ok(stats)
 }
-
 /// Get findings grouped by category for a batch.
 pub async fn get_finding_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<(String, i64)>> {
     let rows = sqlx::query(

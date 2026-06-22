@@ -10,10 +10,12 @@
 //! parsing TOML in JavaScript.
 
 use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::Path;
 use tokio::fs;
 use tracing::info;
@@ -182,6 +184,11 @@ async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
 }
 
 /// Write per-build log files from the live database.
+///
+/// Logs are stored as gzip-compressed blobs.  This function decompresses each
+/// one before writing the plain-text `.log` file so the frontend can serve them
+/// as-is.  Legacy plain-text blobs (pre-migration 004) are handled by falling
+/// back to raw UTF-8 if gzip decompression fails.
 async fn write_logs(
     pool: &SqlitePool,
     output_dir: &Path,
@@ -214,9 +221,22 @@ async fn write_logs(
     let count = rows.len();
     for row in rows {
         let id: String = row.get("id");
-        let log: String = row.get("build_log");
-        fs::write(logs_dir.join(format!("{id}.log")), log).await?;
+        let blob: Vec<u8> = row.get("build_log");
+        let text = decompress_log(&blob);
+        fs::write(logs_dir.join(format!("{id}.log")), text).await?;
     }
     info!(count, "Wrote log files");
     Ok(())
+}
+
+/// Decompress a gzip-compressed log blob to a String.
+/// Falls back to raw UTF-8 interpretation for legacy plain-text blobs.
+fn decompress_log(blob: &[u8]) -> String {
+    let mut gz = GzDecoder::new(blob);
+    let mut s = String::new();
+    if gz.read_to_string(&mut s).is_ok() {
+        s
+    } else {
+        String::from_utf8_lossy(blob).into_owned()
+    }
 }

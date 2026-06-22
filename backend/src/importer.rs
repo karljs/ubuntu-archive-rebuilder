@@ -8,6 +8,8 @@ use crate::db;
 use crate::models::{BuildStatus, BuilderBackend};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
+use flate2::{write::GzEncoder, Compression};
+use std::io::Write;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -142,6 +144,12 @@ async fn import_single_log(
     let submitted_at = build_meta.submitted_at.unwrap_or(now);
     let completed_at = build_meta.completed_at.or(Some(now));
 
+    let log_blob = {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(log_content.as_bytes()).context("gzip encode")?;
+        enc.finish().context("gzip finish")?
+    };
+
     let build = db::insert_build(
         pool,
         &db::NewBuild {
@@ -151,7 +159,7 @@ async fn import_single_log(
             status,
             build_duration_seconds: build_meta.build_duration_seconds,
             peak_memory_mb: build_meta.peak_memory_mb,
-            build_log: Some(&log_content),
+            build_log: Some(log_blob),
             compiler_detected: None,
             submitted_at,
             completed_at,

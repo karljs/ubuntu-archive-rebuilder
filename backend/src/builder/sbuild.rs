@@ -215,6 +215,7 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
         .arg("sbuild")
         .arg("--verbose")
         .arg("--batch")
+        .arg("--purge=always")
         .arg("--chroot-mode=unshare")
         .arg(format!("--dist={}", config.series));
 
