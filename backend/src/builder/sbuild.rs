@@ -189,6 +189,15 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
 // Command construction
 // ---------------------------------------------------------------------------
 
+/// HTTP(S) proxy URL injected into the sbuild chroot's apt configuration (see
+/// `chroot_setup.sh`).  sbuild's unshare chroot does not inherit the outer
+/// shell's `http_proxy` / `https_proxy` env vars, so the pipeline forwards
+/// the proxy explicitly via `REBUILD_HTTP_PROXY`.  Empty/unset leaves apt's
+/// default config untouched.
+fn http_proxy_for_chroot() -> String {
+    std::env::var("REBUILD_HTTP_PROXY").unwrap_or_default()
+}
+
 /// Assemble the full `Command` for `/usr/bin/time -v sbuild ...`.
 ///
 /// For clang profiles, injects chroot-setup (clang install) and
@@ -221,10 +230,13 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
 
     match config.compiler_type {
         CompilerType::Clang => {
+            let proxy = http_proxy_for_chroot();
             let setup_cmd = wrap_in_heredoc(
                 "clang-install.sh",
                 "CLANG_INSTALL_EOF",
-                &CHROOT_SETUP_SCRIPT.replace("__CLANG_VERSION__", &config.compiler_version),
+                &CHROOT_SETUP_SCRIPT
+                    .replace("__CLANG_VERSION__", &config.compiler_version)
+                    .replace("__HTTP_PROXY__", &proxy),
             );
             let starting_cmd = wrap_in_heredoc(
                 "clang-wrapper-setup.sh",
@@ -380,10 +392,21 @@ fn is_time_output(line: &str) -> bool {
 /// sbuild echoes the full script source before executing it, so markers
 /// appearing inside `echo "…"` lines are skipped — only actual output lines
 /// (those starting at column 0 with the marker prefix) are considered.
+///
+/// If neither the success nor the wrapper-failure markers are present, the
+/// chroot-setup phase (which installs clang inside the unshare chroot) is
+/// suspected of having failed before the verification script could run.
+/// Network/proxy errors during `apt-get install clang-NN` are the usual
+/// cause; those emit `REBUILD-ERROR: ...` markers from `chroot_setup.sh`
+/// which we surface here rather than reporting the opaque "UNKNOWN".
 fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
     let mut success = false;
     let mut failed = false;
     let mut version_line: Option<&str> = None;
+    // First `REBUILD-ERROR:` line emitted by chroot_setup.sh, captured so we
+    // can report the underlying cause (e.g. apt failure) rather than a bare
+    // "no verification markers found".
+    let mut chroot_setup_error: Option<&str> = None;
 
     for line in log.lines() {
         let trimmed = line.trim();
@@ -394,6 +417,15 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
             || trimmed.starts_with('\'')
         {
             continue;
+        }
+
+        // Capture chroot-setup failures regardless of compiler type — they
+        // abort the build before the verification phase runs.
+        if chroot_setup_error.is_none()
+            && trimmed.starts_with("REBUILD-ERROR:")
+            && !trimmed.contains("gcc is NOT reporting as clang")
+        {
+            chroot_setup_error = Some(trimmed);
         }
 
         match compiler_type {
@@ -437,6 +469,13 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
         return format!("{label} confirmed");
     }
 
+    // The verification script never ran.  If the chroot-setup phase emitted
+    // an error marker (e.g. apt couldn't install clang through a proxy),
+    // surface that as the proximate cause.
+    if let Some(err) = chroot_setup_error {
+        return format!("ERROR: chroot setup failed - {err}");
+    }
+
     "UNKNOWN: no compiler verification markers found in log".into()
 }
 
@@ -452,8 +491,28 @@ mod tests {
 
     #[test]
     fn chroot_setup_substitutes_version() {
-        let script = CHROOT_SETUP_SCRIPT.replace("__CLANG_VERSION__", "19");
+        let script = CHROOT_SETUP_SCRIPT
+            .replace("__CLANG_VERSION__", "19")
+            .replace("__HTTP_PROXY__", "");
         assert!(script.contains(r#"CLANG_VERSION="19""#));
+        assert!(!script.contains("__CLANG_VERSION__"));
+        assert!(!script.contains("__HTTP_PROXY__"));
+        // Empty proxy must leave the if-branch dead: `if [ -n "" ]` is false.
+        assert!(script.contains("if [ -n \"\" ]; then"));
+    }
+
+    #[test]
+    fn chroot_setup_substitutes_proxy() {
+        let script = CHROOT_SETUP_SCRIPT
+            .replace("__CLANG_VERSION__", "19")
+            .replace("__HTTP_PROXY__", "http://proxy.example:3128");
+        // The script source keeps its backslash-escaped quotes literally, so
+        // check the substituted URL appears in both Proxy lines.
+        assert!(script.contains("Acquire::http::Proxy"));
+        assert!(script.contains("Acquire::https::Proxy"));
+        assert!(script.contains("http://proxy.example:3128"));
+        assert!(script.contains("if [ -n \"http://proxy.example:3128\" ]; then"));
+        assert!(!script.contains("__HTTP_PROXY__"));
         assert!(!script.contains("__CLANG_VERSION__"));
     }
 
@@ -542,5 +601,38 @@ mod tests {
         );
         let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(result.contains("ERROR"), "got: {result}");
+    }
+
+    #[test]
+    fn chroot_setup_apt_failure_is_surfaced() {
+        // apt-get install clang-NN failed inside the chroot (e.g. no proxy).
+        // chroot_setup.sh emits REBUILD-ERROR and exits 1 before the
+        // starting-build verification script ever runs.
+        let log = "=== REBUILD: Installing Clang 18 ===\n\
+                   REBUILD-ERROR: Failed to install clang-18 (check proxy / archive reachability)\n";
+        let result = detect_compiler_from_log(log, CompilerType::Clang);
+        assert!(result.starts_with("ERROR: chroot setup failed"), "got: {result}");
+        assert!(result.contains("Failed to install clang-18"), "got: {result}");
+    }
+
+    #[test]
+    fn chroot_setup_error_does_not_override_wrapper_failure() {
+        // If the wrapper setup also failed, that's the more specific failure
+        // and should win over the earlier chroot-setup warning.
+        let log = concat!(
+            "REBUILD-ERROR: Failed to install clang-18 (check proxy / archive reachability)\n",
+            "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n",
+        );
+        let result = detect_compiler_from_log(log, CompilerType::Clang);
+        assert!(result.contains("wrapper setup FAILED"), "got: {result}");
+    }
+
+    #[test]
+    fn chroot_setup_error_marker_not_confused_with_wrapper_error() {
+        // The wrapper-failure marker also starts with REBUILD-ERROR: but must
+        // not be mis-attributed to chroot setup.
+        let log = "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n";
+        let result = detect_compiler_from_log(log, CompilerType::Clang);
+        assert!(result.contains("wrapper setup FAILED"), "got: {result}");
     }
 }
