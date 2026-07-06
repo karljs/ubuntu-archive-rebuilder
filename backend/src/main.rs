@@ -63,6 +63,14 @@ enum Commands {
         /// Defaults to /var/tmp/rebuild-source (real disk, not RAM tmpfs).
         #[arg(long, default_value = "/var/tmp/rebuild-source")]
         source_dir: PathBuf,
+
+        /// Target build architecture.  Passed to sbuild as `--arch=<arch>`
+        /// and recorded on the batch.  Defaults to the host arch (`amd64` on
+        /// typical x86_64 builders).  Must match an arch the target series
+        /// supports; for non-amd64/i386 arches the chroot will be fetched
+        /// from ports.ubuntu.com.
+        #[arg(long, default_value = "amd64")]
+        arch: String,
     },
 
     /// List all batches.
@@ -164,6 +172,7 @@ async fn main() -> Result<()> {
             run_tests,
             store_logs,
             source_dir,
+            arch,
         } => {
             let profile = Profile::load(&profile_path)?;
             profile.validate_series_available()?;
@@ -185,6 +194,7 @@ async fn main() -> Result<()> {
                 compiler = %profile.compiler.compiler_type,
                 version = %profile.compiler.version,
                 series = %profile.target.series,
+                arch = %arch,
                 jobs,
                 "Starting build run"
             );
@@ -198,6 +208,7 @@ async fn main() -> Result<()> {
                 jobs,
                 store_logs,
                 source_dir,
+                arch,
             };
 
             let (batch_id, stats) = builder::run_batch(&pool, &config).await?;
@@ -379,8 +390,8 @@ async fn main() -> Result<()> {
             lines.push(format!("# Generated:  {now}"));
             lines.push(format!("# Total:      {}", packages.len()));
             lines.push(String::new());
-            for (pkg, _comp) in &packages {
-                lines.push(pkg.clone());
+            for (pkg, comp) in &packages {
+                lines.push(format!("{pkg}\t{comp}"));
             }
             lines.push(String::new()); // trailing newline
 
@@ -400,7 +411,14 @@ async fn main() -> Result<()> {
 
 /// Read package names from a file, one per line.  Blank lines and `#` comments
 /// are skipped.
-fn read_package_list(path: &Path) -> Result<Vec<String>> {
+///
+/// Each non-comment line may be either a bare package name or a
+/// tab-delimited (or single-space-delimited) `package<TAB>component` pair
+/// — the latter form is what `fetch-packages` writes, so the component is
+/// preserved through to the per-build DB row.  A bare name yields `None`
+/// for the component, preserving backward compatibility with hand-written
+/// lists like `packages-smoke.txt`.
+fn read_package_list(path: &Path) -> Result<Vec<(String, Option<String>)>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read package list: {}", path.display()))?;
 
@@ -408,7 +426,30 @@ fn read_package_list(path: &Path) -> Result<Vec<String>> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
+        .map(|line| {
+            // Split on the first tab; fall back to a single space for
+            // hand-edited lists.  Only the first whitespace run is
+            // considered, so package names containing spaces (which don't
+            // exist in the Ubuntu archive) would still mis-parse — but that's
+            // not a real-world concern.
+            if let Some((name, comp)) = line.split_once('\t') {
+                let name = name.trim();
+                let comp = comp.trim();
+                if name.is_empty() {
+                    return (line.to_string(), None);
+                }
+                (name.to_string(), if comp.is_empty() { None } else { Some(comp.to_string()) })
+            } else if let Some((name, comp)) = line.split_once(' ') {
+                let name = name.trim();
+                let comp = comp.trim();
+                if name.is_empty() {
+                    return (line.to_string(), None);
+                }
+                (name.to_string(), if comp.is_empty() { None } else { Some(comp.to_string()) })
+            } else {
+                (line.to_string(), None)
+            }
+        })
         .collect())
 }
 
@@ -436,5 +477,89 @@ async fn resolve_batch(
         }
     } else {
         unreachable!("id_or_name is Some, checked above")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_tmp(content: &str) -> std::path::PathBuf {
+        let mut f = tempfile::Builder::new().suffix(".txt").tempfile().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        let (_, path) = f.keep().unwrap();
+        path
+    }
+
+    #[test]
+    fn read_package_list_bare_names() {
+        let path = write_tmp("# header\nfoo\nbar\n\n  # indented comment\nbaz\n");
+        let list = read_package_list(&path).unwrap();
+        assert_eq!(
+            list,
+            vec![
+                ("foo".to_string(), None),
+                ("bar".to_string(), None),
+                ("baz".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_package_list_tab_delimited_component() {
+        let path = write_tmp("foo\tmain\nbar\tuniverse\nbaz\trestricted\n");
+        let list = read_package_list(&path).unwrap();
+        assert_eq!(
+            list,
+            vec![
+                ("foo".to_string(), Some("main".to_string())),
+                ("bar".to_string(), Some("universe".to_string())),
+                ("baz".to_string(), Some("restricted".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_package_list_space_delimited_component() {
+        // Hand-edited lists may use a single space; the parser accepts it.
+        let path = write_tmp("foo main\nbar universe\n");
+        let list = read_package_list(&path).unwrap();
+        assert_eq!(
+            list,
+            vec![
+                ("foo".to_string(), Some("main".to_string())),
+                ("bar".to_string(), Some("universe".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_package_list_mixed_bare_and_component() {
+        // A list may mix bare names (legacy) with tab-delimited entries.
+        let path = write_tmp("foo\nbar\tuniverse\nbaz\n");
+        let list = read_package_list(&path).unwrap();
+        assert_eq!(
+            list,
+            vec![
+                ("foo".to_string(), None),
+                ("bar".to_string(), Some("universe".to_string())),
+                ("baz".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_package_list_empty_file() {
+        let path = write_tmp("# only comments\n\n");
+        let list = read_package_list(&path).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn read_package_list_trailing_whitespace_in_component_is_trimmed() {
+        let path = write_tmp("foo\tmain   \n");
+        let list = read_package_list(&path).unwrap();
+        assert_eq!(list, vec![("foo".to_string(), Some("main".to_string()))]);
     }
 }

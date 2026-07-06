@@ -190,7 +190,8 @@ impl std::fmt::Display for BuilderBackend {
     }
 }
 
-/// A batch is a collection of builds sharing a compiler profile.
+/// A batch is a collection of builds sharing a compiler profile and target
+/// architecture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Batch {
     pub id: Uuid,
@@ -198,6 +199,10 @@ pub struct Batch {
     pub compiler_type: String,
     pub compiler_version: String,
     pub series: String,
+    /// Target architecture for every build in this batch (e.g. "amd64").
+    /// A batch is implicitly single-arch: sbuild is invoked once per package
+    /// with the same `--arch`.
+    pub arch: String,
     pub profile_name: String,
     pub profile_content: String,
     pub builder_backend: BuilderBackend,
@@ -219,6 +224,10 @@ pub struct Build {
     pub compiler_detected: Option<String>,
     pub submitted_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Archive component the source package belongs to (main / universe /
+    /// restricted / multiverse).  `None` for legacy rows and bare-name
+    /// package lists that did not carry component metadata.
+    pub component: Option<String>,
 }
 
 /// An error finding or observation from build-log analysis.
@@ -244,6 +253,9 @@ pub struct BuildResult {
     pub peak_memory_mb: Option<i64>,
     pub build_log: String,
     pub compiler_detected: Option<String>,
+    /// Archive component the source package belongs to, if known from the
+    /// package list.  Forwarded to `NewBuild` for persistence.
+    pub component: Option<String>,
 }
 
 /// How build logs are stored.

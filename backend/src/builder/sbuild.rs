@@ -53,6 +53,9 @@ const SBUILD_CONFIG_TEMPLATE: &str = include_str!("scripts/sbuild_config.pl.tmpl
 pub struct SbuildConfig {
     pub dsc_path: PathBuf,
     pub series: String,
+    /// Target build architecture (e.g. "amd64").  Passed to sbuild as
+    /// `--arch=<arch>`.  Defaults to "amd64" at the CLI layer.
+    pub arch: String,
     pub compiler_type: CompilerType,
     pub compiler_version: String,
     /// Extra environment variables for the build (from profile flags).
@@ -226,7 +229,8 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
         .arg("--batch")
         .arg("--purge=always")
         .arg("--chroot-mode=unshare")
-        .arg(format!("--dist={}", config.series));
+        .arg(format!("--dist={}", config.series))
+        .arg(format!("--arch={}", config.arch));
 
     match config.compiler_type {
         CompilerType::Clang => {

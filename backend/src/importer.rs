@@ -34,6 +34,10 @@ pub struct BuildMetadata {
     pub submitted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Archive component (main / universe / restricted / multiverse).
+    /// Optional — imports without component info leave the DB column NULL.
+    #[serde(default)]
+    pub component: Option<String>,
 }
 
 /// Metadata file format — maps log filenames to build metadata.
@@ -47,9 +51,13 @@ pub struct MetadataFile {
 ///
 /// Creates a new batch from the given profile and imports all logs into it.
 /// Requires a metadata file to provide package names, versions, and metrics.
+///
+/// `arch` is recorded on the batch (imports are external logs that don't
+/// carry explicit arch info; the caller supplies it, typically "amd64").
 pub async fn import_from_directory(
     pool: &SqlitePool,
     profile: &Profile,
+    arch: &str,
     log_dir: &Path,
     metadata_path: &Path,
 ) -> Result<(Uuid, ImportStats)> {
@@ -58,7 +66,7 @@ pub async fn import_from_directory(
     let metadata: MetadataFile =
         serde_json::from_str(&content).context("Failed to parse metadata file")?;
 
-    let batch = db::create_batch(pool, profile, BuilderBackend::External).await?;
+    let batch = db::create_batch(pool, profile, BuilderBackend::External, arch).await?;
 
     info!(
         batch_id = %batch.id,
@@ -163,6 +171,7 @@ async fn import_single_log(
             compiler_detected: None,
             submitted_at,
             completed_at,
+            component: build_meta.component.as_deref(),
         },
     )
     .await?;

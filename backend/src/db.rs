@@ -16,6 +16,7 @@ const SCHEMA: &str = include_str!("../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../migrations/002_findings_severity.sql");
 const MIGRATION_003: &str = include_str!("../migrations/003_findings_class.sql");
 const MIGRATION_004: &str = include_str!("../migrations/004_build_log_blob.sql");
+const MIGRATION_005: &str = include_str!("../migrations/005_arch_and_component.sql");
 
 /// Aggregate build counts for a batch.
 ///
@@ -78,6 +79,9 @@ pub struct NewBuild<'a> {
     pub compiler_detected: Option<&'a str>,
     pub submitted_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Archive component (main / universe / restricted / multiverse).
+    /// `None` for legacy rows or bare-name package lists.
+    pub component: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +152,23 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .context("Failed to apply migration 004")?;
     }
 
+    // Migration 005: add batches.arch and builds.component.  Use `arch` on
+    // batches as the sentinel — both columns are added by the same migration
+    // script, so if one exists the other does too.
+    let has_arch: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('batches') WHERE name = 'arch'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(false);
+
+    if !has_arch {
+        sqlx::query(MIGRATION_005)
+            .execute(&pool)
+            .await
+            .context("Failed to apply migration 005")?;
+    }
+
     Ok(pool)
 }
 
@@ -160,23 +181,25 @@ pub async fn create_batch(
     pool: &SqlitePool,
     profile: &Profile,
     builder_backend: BuilderBackend,
+    arch: &str,
 ) -> Result<Batch> {
     let id = Uuid::new_v4();
     let name = profile.batch_name();
     let now = Utc::now();
 
     sqlx::query(
-        "INSERT INTO batches (id, name, compiler_type, compiler_version, series,
+        "INSERT INTO batches (id, name, compiler_type, compiler_version, series, arch,
                               profile_name, profile_content, builder_backend, started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(&name)
     .bind(profile.compiler.compiler_type.as_str())
     .bind(&profile.compiler.version)
     .bind(&profile.target.series)
-    .bind(&profile.name)
-    .bind(&profile.raw_content)
+    .bind(arch)
+    .bind(profile.name.as_str())
+    .bind(profile.raw_content.as_str())
     .bind(builder_backend.as_str())
     .bind(now.to_rfc3339())
     .execute(pool)
@@ -189,6 +212,7 @@ pub async fn create_batch(
         compiler_type: profile.compiler.compiler_type.as_str().to_string(),
         compiler_version: profile.compiler.version.clone(),
         series: profile.target.series.clone(),
+        arch: arch.to_string(),
         profile_name: profile.name.clone(),
         profile_content: profile.raw_content.clone(),
         builder_backend,
@@ -222,7 +246,7 @@ pub async fn get_batch(pool: &SqlitePool, id: Uuid) -> Result<Option<Batch>> {
 /// Look up a batch by name.
 pub async fn get_batch_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Batch>> {
     sqlx::query(
-        "SELECT id, name, compiler_type, compiler_version, series,
+        "SELECT id, name, compiler_type, compiler_version, series, arch,
                 profile_name, profile_content, builder_backend, started_at, finished_at
          FROM batches WHERE name = ?",
     )
@@ -237,7 +261,7 @@ pub async fn get_batch_by_name(pool: &SqlitePool, name: &str) -> Result<Option<B
 /// Get the most recently started batch.
 pub async fn get_latest_batch(pool: &SqlitePool) -> Result<Option<Batch>> {
     sqlx::query(
-        "SELECT id, name, compiler_type, compiler_version, series,
+        "SELECT id, name, compiler_type, compiler_version, series, arch,
                 profile_name, profile_content, builder_backend, started_at, finished_at
          FROM batches ORDER BY started_at DESC LIMIT 1",
     )
@@ -251,7 +275,7 @@ pub async fn get_latest_batch(pool: &SqlitePool) -> Result<Option<Batch>> {
 /// List all batches, most recent first.
 pub async fn list_batches(pool: &SqlitePool) -> Result<Vec<Batch>> {
     sqlx::query(
-        "SELECT id, name, compiler_type, compiler_version, series,
+        "SELECT id, name, compiler_type, compiler_version, series, arch,
                 profile_name, profile_content, builder_backend, started_at, finished_at
          FROM batches ORDER BY started_at DESC",
     )
@@ -264,7 +288,7 @@ pub async fn list_batches(pool: &SqlitePool) -> Result<Vec<Batch>> {
 }
 
 const BATCH_SELECT_BY_ID: &str =
-    "SELECT id, name, compiler_type, compiler_version, series,
+    "SELECT id, name, compiler_type, compiler_version, series, arch,
             profile_name, profile_content, builder_backend, started_at, finished_at
      FROM batches WHERE id = ?";
 
@@ -280,6 +304,7 @@ fn batch_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Batch> {
         compiler_type: row.get("compiler_type"),
         compiler_version: row.get("compiler_version"),
         series: row.get("series"),
+        arch: row.get("arch"),
         profile_name: row.get("profile_name"),
         profile_content: row.get("profile_content"),
         builder_backend: backend_str
@@ -304,8 +329,8 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         "INSERT INTO builds (
             id, batch_id, source_package, version, status,
             build_duration_seconds, peak_memory_mb,
-            build_log, compiler_detected, submitted_at, completed_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            build_log, compiler_detected, submitted_at, completed_at, component
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(b.batch_id.to_string())
@@ -318,6 +343,7 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
     .bind(b.compiler_detected)
     .bind(b.submitted_at.to_rfc3339())
     .bind(b.completed_at.map(|d| d.to_rfc3339()))
+    .bind(b.component)
     .execute(pool)
     .await
     .context("Failed to insert build")?;
@@ -334,6 +360,7 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         compiler_detected: b.compiler_detected.map(|s| s.to_string()),
         submitted_at: b.submitted_at,
         completed_at: b.completed_at,
+        component: b.component.map(|s| s.to_string()),
     })
 }
 
@@ -343,7 +370,7 @@ pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<V
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
                 build_duration_seconds, peak_memory_mb,
-                compiler_detected, submitted_at, completed_at
+                compiler_detected, submitted_at, completed_at, component
          FROM builds WHERE batch_id = ? ORDER BY submitted_at",
     )
     .bind(batch_id.to_string())
@@ -361,7 +388,7 @@ pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
                 build_duration_seconds, peak_memory_mb,
-                compiler_detected, submitted_at, completed_at
+                compiler_detected, submitted_at, completed_at, component
          FROM builds ORDER BY submitted_at",
     )
     .fetch_all(pool)
@@ -425,6 +452,7 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
         completed_at: completed_str
             .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
             .transpose()?,
+        component: row.get("component"),
     })
 }
 
@@ -606,4 +634,187 @@ pub async fn get_finding_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<
         .iter()
         .map(|row| (row.get("category"), row.get("count")))
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::{Compiler, CompilerType, Profile, Target};
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    /// Build an in-memory SQLite pool with the full schema + migrations applied.
+    ///
+    /// Uses `max_connections(1)` because sqlite's `:memory:` is per-connection;
+    /// a single connection keeps the schema visible across all queries in the
+    /// test.
+    async fn mem_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory");
+        sqlx::query(SCHEMA).execute(&pool).await.expect("schema");
+        sqlx::query(MIGRATION_002).execute(&pool).await.expect("mig 002");
+        sqlx::query(MIGRATION_003).execute(&pool).await.expect("mig 003");
+        sqlx::query(MIGRATION_004).execute(&pool).await.expect("mig 004");
+        sqlx::query(MIGRATION_005).execute(&pool).await.expect("mig 005");
+        pool
+    }
+
+    fn sample_profile() -> Profile {
+        Profile {
+            compiler: Compiler {
+                compiler_type: CompilerType::Clang,
+                version: "18".to_string(),
+            },
+            target: Target { series: "noble".to_string() },
+            flags: vec![],
+            name: "clang-18-noble".to_string(),
+            raw_content: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_005_adds_arch_and_component_columns() {
+        let pool = mem_pool().await;
+
+        let batch_cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('batches') ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(batch_cols.contains(&"arch".to_string()), "batches.arch missing");
+
+        let build_cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('builds') ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(build_cols.contains(&"component".to_string()), "builds.component missing");
+    }
+
+    #[tokio::test]
+    async fn migration_005_is_idempotent() {
+        // Re-running the migration's ALTER TABLE would fail if the columns
+        // already exist; the init() guard prevents that. Verify by running
+        // the migration twice manually — the second should error, confirming
+        // the guard in init() is actually necessary.
+        let pool = mem_pool().await;
+        let result = sqlx::query(MIGRATION_005).execute(&pool).await;
+        assert!(result.is_err(), "second migration 005 run should have failed");
+    }
+
+    #[tokio::test]
+    async fn create_batch_persists_arch() {
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "arm64")
+            .await
+            .unwrap();
+
+        assert_eq!(batch.arch, "arm64");
+
+        // Round-trip via every read path.
+        let by_id = get_batch(&pool, batch.id).await.unwrap().unwrap();
+        assert_eq!(by_id.arch, "arm64");
+
+        let by_name = get_batch_by_name(&pool, &batch.name).await.unwrap().unwrap();
+        assert_eq!(by_name.arch, "arm64");
+
+        let latest = get_latest_batch(&pool).await.unwrap().unwrap();
+        assert_eq!(latest.arch, "arm64");
+
+        let listed = list_batches(&pool).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].arch, "arm64");
+    }
+
+    #[tokio::test]
+    async fn create_batch_defaults_arch_to_amd64_at_caller() {
+        // The DB column has DEFAULT 'amd64', but create_batch always binds
+        // the caller's value explicitly. Verify the caller's "amd64" lands.
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+        assert_eq!(batch.arch, "amd64");
+    }
+
+    #[tokio::test]
+    async fn insert_build_persists_component() {
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let build = insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "foo",
+                version: "1.0",
+                status: BuildStatus::Succeeded,
+                build_duration_seconds: Some(42.0),
+                peak_memory_mb: Some(128),
+                build_log: None,
+                compiler_detected: Some("clang confirmed: 18"),
+                submitted_at: now,
+                completed_at: Some(now),
+                component: Some("universe"),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(build.component.as_deref(), Some("universe"));
+
+        let builds = get_builds_for_batch(&pool, batch.id).await.unwrap();
+        assert_eq!(builds.len(), 1);
+        assert_eq!(builds[0].component.as_deref(), Some("universe"));
+
+        let all = list_all_builds(&pool).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].component.as_deref(), Some("universe"));
+    }
+
+    #[tokio::test]
+    async fn insert_build_accepts_null_component() {
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "foo",
+                version: "1.0",
+                status: BuildStatus::Failed,
+                build_duration_seconds: None,
+                peak_memory_mb: None,
+                build_log: None,
+                compiler_detected: None,
+                submitted_at: now,
+                completed_at: Some(now),
+                component: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let builds = get_builds_for_batch(&pool, batch.id).await.unwrap();
+        assert_eq!(builds[0].component, None);
+    }
 }

@@ -26,7 +26,10 @@ use uuid::Uuid;
 /// Parameters for a full batch build run (multiple packages).
 pub struct BuildConfig {
     pub profile: Profile,
-    pub packages: Vec<String>,
+    /// `(package_name, optional archive component)` for each package to build.
+    /// The component is forwarded to the per-build DB row when present, so
+    /// results can be sliced by main / universe / etc.
+    pub packages: Vec<(String, Option<String>)>,
     pub timeout_seconds: u64,
     pub verbose: bool,
     pub run_tests: bool,
@@ -36,6 +39,8 @@ pub struct BuildConfig {
     /// Base directory for source package downloads.
     /// Defaults to `/var/tmp/rebuild-source` (real disk, not tmpfs).
     pub source_dir: PathBuf,
+    /// Target build architecture.  Passed to sbuild as `--arch=<arch>`.
+    pub arch: String,
 }
 
 /// Run a batch of builds, recording each result to the database.
@@ -51,6 +56,7 @@ pub async fn run_batch(
         pool,
         &config.profile,
         BuilderBackend::Sbuild,
+        &config.arch,
     )
     .await?;
 
@@ -77,7 +83,7 @@ pub async fn run_batch(
     });
 
     let total = config.packages.len();
-    for (idx, package_name) in config.packages.iter().enumerate() {
+    for (idx, (package_name, component)) in config.packages.iter().enumerate() {
         if cancel_token.is_cancelled() {
             info!("Batch cancelled, aborting remaining builds");
             break;
@@ -86,7 +92,7 @@ pub async fn run_batch(
         let progress = format!("[{}/{}]", idx + 1, total);
         info!("{progress} Building {package_name}");
 
-        match build_package(package_name, config, cancel_token.clone()).await {
+        match build_package(package_name, component.as_deref(), config, cancel_token.clone()).await {
             Ok(result) => {
                 info!("{progress} {package_name} completed: {}", result.status.as_str());
                 store_build_result(pool, batch.id, &result, config).await?;
@@ -105,6 +111,7 @@ pub async fn run_batch(
                     peak_memory_mb: None,
                     build_log: format!("Build failed to execute: {e}"),
                     compiler_detected: None,
+                    component: component.clone(),
                 };
                 store_build_result(pool, batch.id, &error_result, config).await?;
             }
@@ -128,6 +135,7 @@ pub async fn run_batch(
 /// Build a single source package: fetch source, run sbuild, log compiler status.
 async fn build_package(
     package_name: &str,
+    component: Option<&str>,
     config: &BuildConfig,
     cancel_token: CancellationToken,
 ) -> Result<BuildResult> {
@@ -147,6 +155,7 @@ async fn build_package(
     let sbuild_config = SbuildConfig {
         dsc_path: source.dsc_path,
         series: series.clone(),
+        arch: config.arch.clone(),
         compiler_type: config.profile.compiler.compiler_type,
         compiler_version: config.profile.compiler.version.clone(),
         build_env: config.profile.build_env_vars(),
@@ -179,6 +188,7 @@ async fn build_package(
         peak_memory_mb: result.peak_memory_mb,
         build_log: result.log,
         compiler_detected: result.compiler_detected,
+        component: component.map(|s| s.to_string()),
     })
 }
 
@@ -224,6 +234,7 @@ async fn store_build_result(
             compiler_detected: result.compiler_detected.as_deref(),
             submitted_at: now,
             completed_at: Some(now),
+            component: result.component.as_deref(),
         },
     )
     .await?;
