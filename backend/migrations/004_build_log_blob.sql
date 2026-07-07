@@ -17,6 +17,12 @@
 --   db.commit()
 --   "
 
+-- Use legacy_alter_table so the RENAME does NOT rewrite foreign-key
+-- references in other tables (build_findings.build_id).  Without this,
+-- SQLite would repoint build_findings to builds_old, and once builds_old is
+-- dropped the FK would dangle — causing "no such table: main.builds_old" on
+-- every finding insert.  legacy_alter_table is restored to OFF at the end.
+PRAGMA legacy_alter_table = ON;
 PRAGMA foreign_keys = OFF;
 
 ALTER TABLE builds RENAME TO builds_old;
@@ -49,4 +55,5 @@ CREATE INDEX IF NOT EXISTS idx_builds_batch   ON builds(batch_id);
 CREATE INDEX IF NOT EXISTS idx_builds_status  ON builds(status);
 CREATE INDEX IF NOT EXISTS idx_builds_package ON builds(source_package);
 
+PRAGMA legacy_alter_table = OFF;
 PRAGMA foreign_keys = ON;

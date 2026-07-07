@@ -17,6 +17,7 @@ const MIGRATION_002: &str = include_str!("../migrations/002_findings_severity.sq
 const MIGRATION_003: &str = include_str!("../migrations/003_findings_class.sql");
 const MIGRATION_004: &str = include_str!("../migrations/004_build_log_blob.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_arch_and_component.sql");
+const MIGRATION_006: &str = include_str!("../migrations/006_repair_findings_fk.sql");
 
 /// Aggregate build counts for a batch.
 ///
@@ -167,6 +168,26 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .execute(&pool)
             .await
             .context("Failed to apply migration 005")?;
+    }
+
+    // Migration 006: repair build_findings.build_id foreign keys that were
+    // repointed to the (now-dropped) builds_old table by the original
+    // migration 004.  Detected by checking where build_findings' FK
+    // actually resolves: "builds_old" means the DB was migrated by the
+    // buggy 004 and needs the repair; "builds" (or no FK row at all) means
+    // the DB is already correct.
+    let findings_fk_target: Option<String> = sqlx::query_scalar(
+        "SELECT \"table\" FROM pragma_foreign_key_list('build_findings') LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap_or(None);
+
+    if findings_fk_target.as_deref() == Some("builds_old") {
+        sqlx::query(MIGRATION_006)
+            .execute(&pool)
+            .await
+            .context("Failed to apply migration 006")?;
     }
 
     Ok(pool)
@@ -662,6 +683,7 @@ mod tests {
         sqlx::query(MIGRATION_003).execute(&pool).await.expect("mig 003");
         sqlx::query(MIGRATION_004).execute(&pool).await.expect("mig 004");
         sqlx::query(MIGRATION_005).execute(&pool).await.expect("mig 005");
+        sqlx::query(MIGRATION_006).execute(&pool).await.expect("mig 006");
         pool
     }
 
@@ -816,5 +838,190 @@ mod tests {
 
         let builds = get_builds_for_batch(&pool, batch.id).await.unwrap();
         assert_eq!(builds[0].component, None);
+    }
+
+    /// Regression: migration 004 renamed builds → builds_old and created a
+    /// new builds table.  SQLite's ALTER TABLE RENAME rewrites FK references
+    /// in other tables to follow the rename, so build_findings.build_id
+    /// ended up pointing at the (subsequently dropped) builds_old.  Any
+    /// finding insert then failed with "no such table: main.builds_old".
+    /// Migration 004 now sets legacy_alter_table=ON to prevent the rewrite,
+    /// and migration 006 repairs databases already bitten by it.  This test
+    /// reproduces the original failure mode by inserting a finding right
+    /// after the full migration chain runs.
+    #[tokio::test]
+    async fn insert_finding_after_migrations_succeeds() {
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+        let build = insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "foo",
+                version: "1.0",
+                status: BuildStatus::Failed,
+                build_duration_seconds: None,
+                peak_memory_mb: None,
+                build_log: None,
+                compiler_detected: None,
+                submitted_at: now,
+                completed_at: Some(now),
+                component: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let finding = insert_finding(
+            &pool,
+            build.id,
+            "missing_header",
+            "fatal error: foo.h: No such file or directory",
+            "fatal error: foo.h: No such file or directory",
+            Some(42),
+            FindingSeverity::Error,
+            FindingClass::Toolchain,
+        )
+        .await
+        .expect("finding insert should succeed with FK pointing at builds, not builds_old");
+
+        assert_eq!(finding.build_id, build.id);
+
+        let fetched = get_findings_for_build(&pool, build.id).await.unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].category, "missing_header");
+
+        // The FK target must resolve to `builds`, never `builds_old`.
+        let fk_target: String = sqlx::query_scalar(
+            "SELECT \"table\" FROM pragma_foreign_key_list('build_findings') LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fk_target, "builds");
+    }
+
+    /// Regression for the user-facing failure: a database migrated by the
+    /// original (buggy) migration 004 has `build_findings.build_id` pointing
+    /// at the dropped `builds_old` table, so finding inserts fail with
+    /// "no such table: main.builds_old".  `init()` must detect and repair
+    /// that state via migration 006.  This test stages a broken on-disk
+    /// database (applying the buggy 004 sequence by hand) and then runs
+    /// `init()` against it.
+    #[tokio::test]
+    async fn init_repairs_buggy_migration_004_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("rebuilder.db");
+
+        // Stage: schema + migrations 002/003/005, plus the *buggy* 004
+        // (no legacy_alter_table, so the rename repoints build_findings'
+        // FK at builds_old, which is then dropped).
+        let staging = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        pool_exec(&staging, SCHEMA).await;
+        pool_exec(&staging, MIGRATION_002).await;
+        pool_exec(&staging, MIGRATION_003).await;
+        pool_exec(&staging, MIGRATION_005).await;
+        // Buggy 004: same as the fixed migration but WITHOUT
+        // legacy_alter_table, so the RENAME rewrites build_findings' FK.
+        pool_exec(
+            &staging,
+            r#"
+            PRAGMA foreign_keys = OFF;
+            ALTER TABLE builds RENAME TO builds_old;
+            CREATE TABLE builds (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL REFERENCES batches(id),
+                source_package TEXT NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                build_duration_seconds REAL,
+                peak_memory_mb INTEGER,
+                build_log BLOB,
+                compiler_detected TEXT,
+                submitted_at TEXT NOT NULL,
+                completed_at TEXT,
+                component TEXT,
+                UNIQUE(batch_id, source_package)
+            );
+            INSERT INTO builds
+                SELECT id, batch_id, source_package, version, status,
+                       build_duration_seconds, peak_memory_mb,
+                       build_log, compiler_detected, submitted_at, completed_at, component
+                FROM builds_old;
+            DROP TABLE builds_old;
+            PRAGMA foreign_keys = ON;
+            "#,
+        )
+        .await;
+        // Sanity: the staged DB is genuinely broken.
+        let staged_fk: String = sqlx::query_scalar(
+            "SELECT \"table\" FROM pragma_foreign_key_list('build_findings') LIMIT 1",
+        )
+        .fetch_one(&staging)
+        .await
+        .unwrap();
+        assert_eq!(staged_fk, "builds_old", "test staging is broken");
+        staging.close().await;
+
+        // init() should detect the dangling FK and apply migration 006.
+        let pool = init(&db_path).await.expect("init repairs broken db");
+
+        let repaired_fk: String = sqlx::query_scalar(
+            "SELECT \"table\" FROM pragma_foreign_key_list('build_findings') LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired_fk, "builds");
+
+        // End-to-end: insert a batch → build → finding must succeed.
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let build = insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "foo",
+                version: "1.0",
+                status: BuildStatus::Failed,
+                build_duration_seconds: None,
+                peak_memory_mb: None,
+                build_log: None,
+                compiler_detected: None,
+                submitted_at: now,
+                completed_at: Some(now),
+                component: None,
+            },
+        )
+        .await
+        .unwrap();
+        insert_finding(
+            &pool,
+            build.id,
+            "missing_header",
+            "fatal error: foo.h",
+            "fatal error: foo.h",
+            Some(1),
+            FindingSeverity::Error,
+            FindingClass::Toolchain,
+        )
+        .await
+        .expect("finding insert succeeds after repair");
+    }
+
+    async fn pool_exec(pool: &SqlitePool, sql: &str) {
+        sqlx::query(sql).execute(pool).await.expect("exec");
     }
 }
