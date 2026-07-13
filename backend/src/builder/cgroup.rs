@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
+use tracing::debug;
 use uuid::Uuid;
 
 pub struct BuildCgroup {
@@ -69,36 +70,54 @@ impl BuildCgroup {
         let child_name = format!("rebuild-{build_id}");
         let limit_bytes = memory_limit_mb * 1024 * 1024;
 
+        debug!("Searching for writable cgroup parent, starting from {}", full.display());
+
         let mut current = Some(full.as_path());
         while let Some(dir) = current {
+            debug!("Trying cgroup parent: {}", dir.display());
+
             // Check if `memory` is available at this level.
             let controllers = fs::read_to_string(dir.join("cgroup.controllers"))
                 .unwrap_or_default();
+            debug!("  cgroup.controllers: {:?}", controllers.trim());
+
             if !controllers.split_whitespace().any(|c| c == "memory") {
+                debug!("  no memory controller, skipping to parent");
                 current = dir.parent();
                 continue;
             }
 
             // Try to enable memory for children (no-op if already enabled).
-            // Use OpenOptions to avoid O_TRUNC which cgroupfs rejects.
             let subtree_ctl = dir.join("cgroup.subtree_control");
-            let _ = Self::cgroup_write(&subtree_ctl, "+memory");
+            match Self::cgroup_write(&subtree_ctl, "+memory") {
+                Ok(()) => debug!("  subtree_control +memory: OK"),
+                Err(e) => debug!("  subtree_control +memory: failed ({e})"),
+            }
 
             // Try to create the child cgroup.
             let child_path = dir.join(&child_name);
-            if fs::create_dir(&child_path).is_err() {
-                current = dir.parent();
-                continue;
+            match fs::create_dir(&child_path) {
+                Ok(()) => debug!("  mkdir child: OK at {}", child_path.display()),
+                Err(e) => {
+                    debug!("  mkdir child: failed ({e}), skipping to parent");
+                    current = dir.parent();
+                    continue;
+                }
             }
 
             // Try to set the memory limit.
-            if Self::cgroup_write(&child_path.join("memory.max"), &limit_bytes.to_string()).is_err() {
-                let _ = fs::remove_dir(&child_path);
-                current = dir.parent();
-                continue;
+            match Self::cgroup_write(&child_path.join("memory.max"), &limit_bytes.to_string()) {
+                Ok(()) => {
+                    debug!("  memory.max write: OK — cgroup ready at {}", child_path.display());
+                    return Ok(child_path);
+                }
+                Err(e) => {
+                    debug!("  memory.max write: failed ({e}), cleaning up and trying parent");
+                    let _ = fs::remove_dir(&child_path);
+                    current = dir.parent();
+                    continue;
+                }
             }
-
-            return Ok(child_path);
         }
         anyhow::bail!(
             "No writable cgroup parent with memory controller found \
