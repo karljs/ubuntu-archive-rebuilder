@@ -172,6 +172,9 @@ async fn import_single_log(
             submitted_at,
             completed_at,
             component: build_meta.component.as_deref(),
+            attempt_number: 1,
+            jobs: None,
+            memory_limit_mb: None,
         },
     )
     .await?;

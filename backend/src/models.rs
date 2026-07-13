@@ -231,6 +231,9 @@ pub struct Build {
     /// restricted / multiverse).  `None` for legacy rows and bare-name
     /// package lists that did not carry component metadata.
     pub component: Option<String>,
+    pub attempt_number: i64,
+    pub jobs: Option<i64>,
+    pub memory_limit_mb: Option<i64>,
 }
 
 /// An error finding or observation from build-log analysis.

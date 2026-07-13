@@ -235,6 +235,9 @@ async fn store_build_result(
             submitted_at: now,
             completed_at: Some(now),
             component: result.component.as_deref(),
+            attempt_number: 1,
+            jobs: None,
+            memory_limit_mb: None,
         },
     )
     .await?;
