@@ -1161,7 +1161,60 @@ mod tests {
             .connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
             .await
             .unwrap();
-        pool_exec(&staging, SCHEMA).await;
+
+        // Stage with the pre-007 schema (no attempt_number/jobs/memory_limit_mb,
+        // old UNIQUE constraint).
+        pool_exec(
+            &staging,
+            r#"
+            CREATE TABLE batches (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                compiler_type TEXT NOT NULL,
+                compiler_version TEXT NOT NULL,
+                series TEXT NOT NULL,
+                profile_name TEXT NOT NULL,
+                profile_content TEXT NOT NULL,
+                builder_backend TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_batches_compiler ON batches(compiler_type, compiler_version);
+            CREATE INDEX IF NOT EXISTS idx_batches_series ON batches(series);
+            CREATE INDEX IF NOT EXISTS idx_batches_started ON batches(started_at);
+
+            CREATE TABLE builds (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL REFERENCES batches(id),
+                source_package TEXT NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                build_duration_seconds REAL,
+                peak_memory_mb INTEGER,
+                build_log BLOB,
+                compiler_detected TEXT,
+                submitted_at TEXT NOT NULL,
+                completed_at TEXT,
+                component TEXT,
+                UNIQUE(batch_id, source_package)
+            );
+            CREATE INDEX IF NOT EXISTS idx_builds_batch ON builds(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
+            CREATE INDEX IF NOT EXISTS idx_builds_package ON builds(source_package);
+
+            CREATE TABLE build_findings (
+                id TEXT PRIMARY KEY,
+                build_id TEXT NOT NULL REFERENCES builds(id),
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                excerpt TEXT NOT NULL,
+                line_number INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_findings_build ON build_findings(build_id);
+            CREATE INDEX IF NOT EXISTS idx_findings_category ON build_findings(category);
+            "#,
+        )
+        .await;
         pool_exec(&staging, MIGRATION_002).await;
         pool_exec(&staging, MIGRATION_003).await;
         pool_exec(&staging, MIGRATION_004).await;

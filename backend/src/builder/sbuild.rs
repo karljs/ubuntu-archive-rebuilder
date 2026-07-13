@@ -97,14 +97,19 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
 
     // Attempt to create a cgroup for this build. If cgroups v2 or user
     // delegation is unavailable, log a warning and proceed without a
-    // memory limit (graceful degradation).
+    // memory limit (graceful degradation). A memory limit of 0 means "no
+    // limit", so skip cgroup creation entirely in that case.
     let build_id = Uuid::new_v4();
-    let cgroup = match BuildCgroup::create(build_id, config.memory_limit_mb) {
-        Ok(cg) => Some(cg),
-        Err(e) => {
-            warn!("Cgroup unavailable, building without memory limit: {e}");
-            None
+    let cgroup = if config.memory_limit_mb > 0 {
+        match BuildCgroup::create(build_id, config.memory_limit_mb) {
+            Ok(cg) => Some(cg),
+            Err(e) => {
+                warn!("Cgroup unavailable, building without memory limit: {e}");
+                None
+            }
         }
+    } else {
+        None
     };
 
     let mut child = cmd.spawn().context("Failed to spawn sbuild")?;

@@ -14,6 +14,12 @@ pub struct BuildCgroup {
     path: PathBuf,
 }
 
+impl Drop for BuildCgroup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
 impl BuildCgroup {
     /// Discover the user-delegated cgroup root by reading `/proc/self/cgroup`.
     /// Returns the full filesystem path (e.g. `/sys/fs/cgroup/user.slice/...`).
@@ -21,13 +27,14 @@ impl BuildCgroup {
         let raw = fs::read_to_string("/proc/self/cgroup")
             .context("Failed to read /proc/self/cgroup")?;
         // cgroup v2 format: "0::/user.slice/user-1000.slice/user@1000.service"
-        let line = raw.lines().next().ok_or_else(|| {
-            anyhow::anyhow!("/proc/self/cgroup is empty")
-        })?;
+        // On hybrid systems, filter for the v2 entry (starts with "0::").
+        let line = raw
+            .lines()
+            .find(|l| l.starts_with("0::"))
+            .ok_or_else(|| anyhow::anyhow!("No cgroup v2 entry found in /proc/self/cgroup"))?;
         let path = line
-            .splitn(3, ':')
-            .nth(2)
-            .ok_or_else(|| anyhow::anyhow!("Unexpected /proc/self/cgroup format: {line}"))?;
+            .strip_prefix("0::")
+            .ok_or_else(|| anyhow::anyhow!("Unexpected cgroup v2 format: {line}"))?;
         if path.is_empty() {
             anyhow::bail!("Empty cgroup path in /proc/self/cgroup");
         }
