@@ -262,6 +262,9 @@ pub struct BuildResult {
     /// Archive component the source package belongs to, if known from the
     /// package list.  Forwarded to `NewBuild` for persistence.
     pub component: Option<String>,
+    pub jobs: usize,
+    pub memory_limit_mb: Option<u64>,
+    pub attempt_number: u32,
 }
 
 /// How build logs are stored.
