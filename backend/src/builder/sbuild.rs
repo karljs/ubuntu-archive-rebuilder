@@ -33,10 +33,12 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+use crate::builder::BuildCgroup;
 use crate::builder::time_parser::parse_time_output;
 use crate::analyzer::infer_status;
 use crate::models::BuildStatus;
 use crate::profile::CompilerType;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Shell script templates — loaded at compile time from external files so they
@@ -65,6 +67,7 @@ pub struct SbuildConfig {
     pub run_tests: bool,
     pub jobs: usize,
     pub cancel_token: CancellationToken,
+    pub memory_limit_mb: u64,
 }
 
 /// Outcome of a single sbuild run, before database insertion.
@@ -74,6 +77,7 @@ pub struct SbuildResult {
     pub duration_seconds: Option<f64>,
     pub peak_memory_mb: Option<i64>,
     pub compiler_detected: Option<String>,
+    pub memory_limit_mb: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,9 +95,29 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
 
     debug!("Spawning: {:?}", cmd);
 
+    // Attempt to create a cgroup for this build. If cgroups v2 or user
+    // delegation is unavailable, log a warning and proceed without a
+    // memory limit (graceful degradation).
+    let build_id = Uuid::new_v4();
+    let cgroup = match BuildCgroup::create(build_id, config.memory_limit_mb) {
+        Ok(cg) => Some(cg),
+        Err(e) => {
+            warn!("Cgroup unavailable, building without memory limit: {e}");
+            None
+        }
+    };
+
     let mut child = cmd.spawn().context("Failed to spawn sbuild")?;
     let child_pid = child.id().context("Failed to get child PID")?;
     let pgid = Pid::from_raw(child_pid as i32);
+
+    // Move the sbuild process into the cgroup so it and all its children
+    // (make, compilers, apt) are subject to the memory limit.
+    if let Some(ref cg) = cgroup {
+        if let Err(e) = cg.add_process(child_pid) {
+            warn!("Failed to add process to cgroup: {e}");
+        }
+    }
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;
@@ -179,12 +203,26 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         infer_status(&log, exit_code)
     };
 
+    // Check if the build was OOM-killed by the cgroup. This overrides
+    // the inferred status because a cgroup OOM kill is the authoritative
+    // cause of failure.
+    let (final_status, final_memory_limit_mb) = if let Some(cg) = cgroup {
+        let oom_killed = cg.was_oom_killed().unwrap_or(false);
+        let limit = Some(config.memory_limit_mb);
+        let _ = cg.cleanup();
+        let status = if oom_killed { BuildStatus::OomKilled } else { status };
+        (status, limit)
+    } else {
+        (status, None)
+    };
+
     Ok(SbuildResult {
-        status,
+        status: final_status,
         log,
         duration_seconds: metrics.wall_time_seconds,
         peak_memory_mb: metrics.peak_memory_kb.map(|kb| kb / 1024),
         compiler_detected: Some(compiler_detected),
+        memory_limit_mb: final_memory_limit_mb,
     })
 }
 

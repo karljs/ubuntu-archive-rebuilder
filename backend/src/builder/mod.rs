@@ -166,6 +166,7 @@ async fn build_package(
         run_tests: config.run_tests,
         jobs: config.jobs,
         cancel_token,
+        memory_limit_mb: 0,
     };
 
     let result = run_sbuild(&sbuild_config).await?;
