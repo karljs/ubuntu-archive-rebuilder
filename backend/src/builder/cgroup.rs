@@ -39,7 +39,9 @@ impl BuildCgroup {
         if path.is_empty() {
             anyhow::bail!("Empty cgroup path in /proc/self/cgroup");
         }
-        Ok(path.to_string())
+        // Strip leading '/' so PathBuf::join appends rather than replaces.
+        // (Path::join with an absolute path discards the base — a common Rust gotcha.)
+        Ok(path.trim_start_matches('/').to_string())
     }
 
     /// Open a cgroupfs file for writing without O_TRUNC (which cgroupfs rejects).
