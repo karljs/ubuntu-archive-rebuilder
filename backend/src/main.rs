@@ -71,6 +71,13 @@ enum Commands {
         /// from ports.ubuntu.com.
         #[arg(long, default_value = "amd64")]
         arch: String,
+
+        /// Per-build cgroup memory limit in MB.  When set, each sbuild
+        /// invocation is placed in a cgroup with this memory limit.  If a
+        /// build exceeds the limit, it is killed and marked as OOM-killed.
+        /// Default: 14336 (14 GB), tuned for a 15 GB host.
+        #[arg(long, default_value = "14336")]
+        memory_limit_mb: u64,
     },
 
     /// List all batches.
@@ -173,6 +180,7 @@ async fn main() -> Result<()> {
             store_logs,
             source_dir,
             arch,
+            memory_limit_mb,
         } => {
             let profile = Profile::load(&profile_path)?;
             profile.validate_series_available()?;
@@ -209,6 +217,7 @@ async fn main() -> Result<()> {
                 store_logs,
                 source_dir,
                 arch,
+                memory_limit_mb,
             };
 
             let (batch_id, stats) = builder::run_batch(&pool, &config).await?;
@@ -220,6 +229,7 @@ async fn main() -> Result<()> {
             println!("  Failed: {} ({:.1}%)", stats.failed, stats.percent(stats.failed));
             println!("  Dep-wait: {}", stats.dep_wait);
             println!("  Timeout: {}", stats.timeout);
+            println!("  Oom-killed: {}", stats.oom_killed);
         }
 
         Commands::List => {
@@ -268,6 +278,9 @@ async fn main() -> Result<()> {
             }
             println!("  Dep-wait: {}", stats.dep_wait);
             println!("  Timeout: {}", stats.timeout);
+            if stats.oom_killed > 0 {
+                println!("  Oom-killed: {}", stats.oom_killed);
+            }
 
             if !findings.is_empty() {
                 println!();
