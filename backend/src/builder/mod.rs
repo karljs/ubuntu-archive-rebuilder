@@ -86,6 +86,22 @@ pub async fn run_batch(
         cancel_signal.cancel();
     });
 
+    // Verify cgroup v2 availability for memory limiting. If unavailable,
+    // builds run without protection (graceful degradation).
+    if config.memory_limit_mb > 0 {
+        match std::fs::read_to_string("/proc/self/cgroup") {
+            Ok(content) => {
+                let has_v2 = content.lines().any(|l| l.starts_with("0::"));
+                if !has_v2 {
+                    warn!("Cgroup v2 not available. Builds will run without memory protection.");
+                }
+            }
+            Err(e) => {
+                warn!("Cannot read /proc/self/cgroup: {e}. Builds will run without memory protection.");
+            }
+        }
+    }
+
     let total = config.packages.len();
     for (idx, (package_name, component)) in config.packages.iter().enumerate() {
         if cancel_token.is_cancelled() {
