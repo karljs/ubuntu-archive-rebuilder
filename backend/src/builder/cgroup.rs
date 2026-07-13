@@ -21,9 +21,9 @@ impl Drop for BuildCgroup {
 }
 
 impl BuildCgroup {
-    /// Discover the user-delegated cgroup root by reading `/proc/self/cgroup`.
-    /// Returns the full filesystem path (e.g. `/sys/fs/cgroup/user.slice/...`).
-    fn discover_cgroup_root() -> Result<PathBuf> {
+    /// Discover the current process's cgroup path by reading `/proc/self/cgroup`.
+    /// Returns the cgroup v2 hierarchy path (e.g. `/user.slice/user-1000.slice/...`).
+    fn read_cgroup_v2_path() -> Result<String> {
         let raw = fs::read_to_string("/proc/self/cgroup")
             .context("Failed to read /proc/self/cgroup")?;
         // cgroup v2 format: "0::/user.slice/user-1000.slice/user@1000.service"
@@ -38,16 +38,58 @@ impl BuildCgroup {
         if path.is_empty() {
             anyhow::bail!("Empty cgroup path in /proc/self/cgroup");
         }
-        Ok(PathBuf::from("/sys/fs/cgroup").join(path))
+        Ok(path.to_string())
+    }
+
+    /// Find a writable parent cgroup where we can create a memory-limited child.
+    ///
+    /// Walks up the cgroup hierarchy from the current process's cgroup, looking
+    /// for the first ancestor where:
+    ///   1. `memory` is available in `cgroup.controllers`
+    ///   2. We can enable it in `cgroup.subtree_control`
+    ///
+    /// This handles the common case where the process is inside a terminal scope
+    /// (e.g. `app-ghostty-surface-transient-*.scope`) that doesn't have the
+    /// memory controller delegated. The standard delegation point is
+    /// `user@UID.service`, which is an ancestor of the terminal scope.
+    fn find_writable_parent() -> Result<PathBuf> {
+        let cgroup_path = Self::read_cgroup_v2_path()?;
+        let full = PathBuf::from("/sys/fs/cgroup").join(&cgroup_path);
+
+        // Walk up from the current cgroup to the root, trying each level.
+        let mut current = Some(full.as_path());
+        while let Some(dir) = current {
+            // Check if `memory` is available at this level.
+            let controllers = fs::read_to_string(dir.join("cgroup.controllers"))
+                .unwrap_or_default();
+            if controllers.split_whitespace().any(|c| c == "memory") {
+                // Try to enable memory for children at this level.
+                // This may fail with EPERM if we don't own this cgroup,
+                // but that's fine — we'll try the parent next.
+                let _ = fs::write(dir.join("cgroup.subtree_control"), "+memory");
+                // Verify it actually got enabled.
+                let subtree = fs::read_to_string(dir.join("cgroup.subtree_control"))
+                    .unwrap_or_default();
+                if subtree.split_whitespace().any(|c| c == "memory") {
+                    return Ok(dir.to_path_buf());
+                }
+            }
+            current = dir.parent();
+        }
+        anyhow::bail!(
+            "No writable cgroup parent with memory controller found \
+             (walked up from {cgroup_path}). \
+             Ensure cgroup v2 delegation is enabled for your user session."
+        )
     }
 
     /// Create a cgroup for this build under the user-delegated subtree,
     /// with a memory limit set.
     pub fn create(build_id: Uuid, memory_limit_mb: u64) -> Result<Self> {
-        let root = Self::discover_cgroup_root()?;
-        let path = root.join(format!("rebuild-{build_id}"));
+        let parent = Self::find_writable_parent()?;
+        let path = parent.join(format!("rebuild-{build_id}"));
 
-        fs::create_dir_all(&path)
+        fs::create_dir(&path)
             .with_context(|| format!("Failed to create cgroup at {}", path.display()))?;
 
         // Set memory limit (convert MB to bytes).
