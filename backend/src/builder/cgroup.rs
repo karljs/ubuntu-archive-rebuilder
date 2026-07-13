@@ -41,40 +41,64 @@ impl BuildCgroup {
         Ok(path.to_string())
     }
 
-    /// Find a writable parent cgroup where we can create a memory-limited child.
+    /// Open a cgroupfs file for writing without O_TRUNC (which cgroupfs rejects).
+    fn cgroup_write(path: &std::path::Path, data: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.write_all(data.as_bytes())?;
+        Ok(())
+    }
+
+    /// Find a writable parent cgroup where we can create a memory-limited child,
+    /// and create the child there.
     ///
-    /// Walks up the cgroup hierarchy from the current process's cgroup, looking
-    /// for the first ancestor where:
-    ///   1. `memory` is available in `cgroup.controllers`
-    ///   2. We can enable it in `cgroup.subtree_control`
+    /// Walks up the cgroup hierarchy from the current process's cgroup. At each
+    /// level, tries to:
+    ///   1. Enable `memory` in `cgroup.subtree_control` (may already be enabled)
+    ///   2. Create a child cgroup directory
+    ///   3. Write `memory.max`
     ///
-    /// This handles the common case where the process is inside a terminal scope
-    /// (e.g. `app-ghostty-surface-transient-*.scope`) that doesn't have the
-    /// memory controller delegated. The standard delegation point is
-    /// `user@UID.service`, which is an ancestor of the terminal scope.
-    fn find_writable_parent() -> Result<PathBuf> {
+    /// If all three succeed, the child cgroup is ready. If any step fails, cleans
+    /// up and tries the parent. This handles the common case where the process is
+    /// inside a terminal scope that doesn't have the memory controller delegated —
+    /// it walks up to `user@UID.service` or `app.slice` where memory is already
+    /// enabled.
+    fn find_and_create_child(build_id: Uuid, memory_limit_mb: u64) -> Result<PathBuf> {
         let cgroup_path = Self::read_cgroup_v2_path()?;
         let full = PathBuf::from("/sys/fs/cgroup").join(&cgroup_path);
+        let child_name = format!("rebuild-{build_id}");
+        let limit_bytes = memory_limit_mb * 1024 * 1024;
 
-        // Walk up from the current cgroup to the root, trying each level.
         let mut current = Some(full.as_path());
         while let Some(dir) = current {
             // Check if `memory` is available at this level.
             let controllers = fs::read_to_string(dir.join("cgroup.controllers"))
                 .unwrap_or_default();
-            if controllers.split_whitespace().any(|c| c == "memory") {
-                // Try to enable memory for children at this level.
-                // This may fail with EPERM if we don't own this cgroup,
-                // but that's fine — we'll try the parent next.
-                let _ = fs::write(dir.join("cgroup.subtree_control"), "+memory");
-                // Verify it actually got enabled.
-                let subtree = fs::read_to_string(dir.join("cgroup.subtree_control"))
-                    .unwrap_or_default();
-                if subtree.split_whitespace().any(|c| c == "memory") {
-                    return Ok(dir.to_path_buf());
-                }
+            if !controllers.split_whitespace().any(|c| c == "memory") {
+                current = dir.parent();
+                continue;
             }
-            current = dir.parent();
+
+            // Try to enable memory for children (no-op if already enabled).
+            // Use OpenOptions to avoid O_TRUNC which cgroupfs rejects.
+            let subtree_ctl = dir.join("cgroup.subtree_control");
+            let _ = Self::cgroup_write(&subtree_ctl, "+memory");
+
+            // Try to create the child cgroup.
+            let child_path = dir.join(&child_name);
+            if fs::create_dir(&child_path).is_err() {
+                current = dir.parent();
+                continue;
+            }
+
+            // Try to set the memory limit.
+            if Self::cgroup_write(&child_path.join("memory.max"), &limit_bytes.to_string()).is_err() {
+                let _ = fs::remove_dir(&child_path);
+                current = dir.parent();
+                continue;
+            }
+
+            return Ok(child_path);
         }
         anyhow::bail!(
             "No writable cgroup parent with memory controller found \
@@ -86,23 +110,13 @@ impl BuildCgroup {
     /// Create a cgroup for this build under the user-delegated subtree,
     /// with a memory limit set.
     pub fn create(build_id: Uuid, memory_limit_mb: u64) -> Result<Self> {
-        let parent = Self::find_writable_parent()?;
-        let path = parent.join(format!("rebuild-{build_id}"));
-
-        fs::create_dir(&path)
-            .with_context(|| format!("Failed to create cgroup at {}", path.display()))?;
-
-        // Set memory limit (convert MB to bytes).
-        let limit_bytes = memory_limit_mb * 1024 * 1024;
-        fs::write(path.join("memory.max"), limit_bytes.to_string())
-            .with_context(|| format!("Failed to set memory.max at {}", path.display()))?;
-
+        let path = Self::find_and_create_child(build_id, memory_limit_mb)?;
         Ok(BuildCgroup { path })
     }
 
     /// Move a process (by PID) into this cgroup by writing to cgroup.procs.
     pub fn add_process(&self, pid: u32) -> Result<()> {
-        fs::write(self.path.join("cgroup.procs"), pid.to_string())
+        Self::cgroup_write(&self.path.join("cgroup.procs"), &pid.to_string())
             .with_context(|| format!("Failed to add PID {pid} to cgroup at {}", self.path.display()))?;
         Ok(())
     }
