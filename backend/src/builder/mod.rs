@@ -7,7 +7,7 @@ mod source;
 mod time_parser;
 
 pub use cgroup::BuildCgroup;
-pub use sbuild::{run_sbuild, SbuildConfig};
+pub use sbuild::{run_sbuild, ChrootMode, SbuildConfig};
 pub use source::{fetch_source, SourcePackage};
 pub use time_parser::parse_time_output;
 
@@ -45,6 +45,8 @@ pub struct BuildConfig {
     pub arch: String,
     /// Memory limit for the build cgroup, in MiB.  0 means no limit.
     pub memory_limit_mb: u64,
+    /// sbuild chroot backend: unshare (ephemeral) or schroot (persistent).
+    pub chroot_mode: ChrootMode,
 }
 
 /// Run a batch of builds, recording each result to the database.
@@ -215,6 +217,7 @@ async fn build_package(
         jobs,
         cancel_token,
         memory_limit_mb: config.memory_limit_mb,
+        chroot_mode: config.chroot_mode,
     };
 
     let result = run_sbuild(&sbuild_config).await?;

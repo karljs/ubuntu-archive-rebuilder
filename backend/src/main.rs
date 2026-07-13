@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rebuilder::{builder, db, export, fetcher, models::StoreLogs, profile::Profile};
+use rebuilder::{builder, builder::ChrootMode, db, export, fetcher, models::StoreLogs, profile::Profile};
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -78,6 +78,19 @@ enum Commands {
         /// Default: 14336 (14 GB), tuned for a 15 GB host.
         #[arg(long, default_value = "14336")]
         memory_limit_mb: u64,
+
+        /// sbuild chroot backend to use.
+        ///
+        ///   unshare — ephemeral chroots via user namespaces (default, no root
+        ///             needed, but fresh debootstrap/dep install per build).
+        ///   schroot — persistent schroot directory chroots (requires
+        ///             pre-created chroot via sbuild-createchroot, but build
+        ///             deps persist across builds and compilers can be
+        ///             pre-installed for much faster iteration).
+        ///
+        /// Can also be set via the REBUILD_CHROOT_MODE environment variable.
+        #[arg(long, default_value = "unshare", env = "REBUILD_CHROOT_MODE")]
+        chroot_mode: ChrootMode,
     },
 
     /// List all batches.
@@ -181,9 +194,15 @@ async fn main() -> Result<()> {
             source_dir,
             arch,
             memory_limit_mb,
+            chroot_mode,
         } => {
             let profile = Profile::load(&profile_path)?;
-            profile.validate_series_available()?;
+
+            // For unshare mode, the series must have a debootstrap script.
+            // For schroot mode, the chroot pre-exists — skip this check.
+            if chroot_mode == ChrootMode::Unshare {
+                profile.validate_series_available()?;
+            }
 
             let package_list = read_package_list(&packages)?;
             if package_list.is_empty() {
@@ -204,6 +223,7 @@ async fn main() -> Result<()> {
                 series = %profile.target.series,
                 arch = %arch,
                 jobs,
+                chroot_mode = %chroot_mode,
                 "Starting build run"
             );
 
@@ -218,6 +238,7 @@ async fn main() -> Result<()> {
                 source_dir,
                 arch,
                 memory_limit_mb,
+                chroot_mode,
             };
 
             let (batch_id, stats) = builder::run_batch(&pool, &config).await?;

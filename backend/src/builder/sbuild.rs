@@ -40,6 +40,45 @@ use crate::models::BuildStatus;
 use crate::profile::CompilerType;
 use uuid::Uuid;
 
+/// Selects sbuild's chroot backend.
+///
+/// - `Unshare`: ephemeral chroots via user namespaces (default, no root needed).
+/// - `Schroot`: persistent schroot directory chroots (requires pre-created
+///   chroot, but build deps persist across builds and compilers can be
+///   pre-installed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChrootMode {
+    Unshare,
+    Schroot,
+}
+
+impl ChrootMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unshare => "unshare",
+            Self::Schroot => "schroot",
+        }
+    }
+}
+
+impl std::str::FromStr for ChrootMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "unshare" => Ok(Self::Unshare),
+            "schroot" => Ok(Self::Schroot),
+            other => Err(format!("unknown chroot mode: {other} (expected: unshare, schroot)")),
+        }
+    }
+}
+
+impl std::fmt::Display for ChrootMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shell script templates — loaded at compile time from external files so they
 // can be linted with shellcheck independently.  Placeholders are substituted
@@ -68,6 +107,8 @@ pub struct SbuildConfig {
     pub jobs: usize,
     pub cancel_token: CancellationToken,
     pub memory_limit_mb: u64,
+    /// sbuild chroot backend: unshare (ephemeral) or schroot (persistent).
+    pub chroot_mode: ChrootMode,
 }
 
 /// Outcome of a single sbuild run, before database insertion.
@@ -256,24 +297,42 @@ fn http_proxy_for_chroot() -> String {
 fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempFile)> {
     let dsc_dir = config.dsc_path.parent().context("Invalid .dsc path")?;
 
-    let sbuild_config_file = generate_sbuild_config(config.jobs, config.run_tests, &config.build_env)?;
-
-    // sbuild's unshare mode extracts chroots into $TMPDIR which defaults to
-    // /tmp. On this machine /tmp is a 44 GB tmpfs and large builds exhaust it,
-    // so redirect to real disk instead.
-    let scratch_dir = PathBuf::from("/var/tmp/rebuild-builds");
-    std::fs::create_dir_all(&scratch_dir)
-        .context("Failed to create /var/tmp/rebuild-builds")?;
+    let sbuild_config_file = generate_sbuild_config(
+        config.jobs,
+        config.run_tests,
+        &config.build_env,
+        config.chroot_mode,
+    )?;
 
     let mut cmd = Command::new("/usr/bin/time");
     cmd.arg("-v")
         .arg("sbuild")
         .arg("--verbose")
         .arg("--batch")
-        .arg("--purge=always")
-        .arg("--chroot-mode=unshare")
         .arg(format!("--dist={}", config.series))
         .arg(format!("--arch={}", config.arch));
+
+    match config.chroot_mode {
+        ChrootMode::Unshare => {
+            // sbuild's unshare mode extracts chroots into $TMPDIR which
+            // defaults to /tmp. On this machine /tmp is a 44 GB tmpfs and
+            // large builds exhaust it, so redirect to real disk instead.
+            let scratch_dir = PathBuf::from("/var/tmp/rebuild-builds");
+            std::fs::create_dir_all(&scratch_dir)
+                .context("Failed to create /var/tmp/rebuild-builds")?;
+
+            cmd.arg("--chroot-mode=unshare")
+                .arg("--purge=always")
+                .env("TMPDIR", &scratch_dir);
+        }
+        ChrootMode::Schroot => {
+            // No --chroot-mode flag: schroot is sbuild's default. Purge
+            // settings are controlled via the generated config file so
+            // that $purge_build_deps = 'never' is not overridden by CLI.
+            // No TMPDIR: schroot uses its own chroot directory, not a
+            // tarball extracted into TMPDIR.
+        }
+    }
 
     match config.compiler_type {
         CompilerType::Clang => {
@@ -308,7 +367,6 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
         .arg(&config.dsc_path)
         .current_dir(dsc_dir)
         .env("SBUILD_CONFIG", sbuild_config_file.path())
-        .env("TMPDIR", &scratch_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -344,10 +402,16 @@ fn wrap_in_heredoc(filename: &str, delimiter: &str, body: &str) -> String {
 /// Loaded via `SBUILD_CONFIG` which sbuild evaluates after system and user
 /// configs, so all assignments here take precedence. Profile flags are
 /// injected into `$build_environment` so they reach `dpkg-buildpackage`.
+///
+/// Purge behaviour depends on the chroot mode:
+/// - `unshare`: deps purged always (ephemeral chroot, no reuse possible).
+/// - `schroot`: deps purged never (persistent chroot, deps accumulate for
+///   faster subsequent builds).
 fn generate_sbuild_config(
     jobs: usize,
     run_tests: bool,
     build_env: &[(String, String)],
+    chroot_mode: ChrootMode,
 ) -> Result<tempfile::NamedTempFile> {
     let nocheck = if run_tests { "" } else { " nocheck" };
 
@@ -363,7 +427,14 @@ fn generate_sbuild_config(
     }
     let env_block = env_entries.join("\n    ");
 
-    let config = SBUILD_CONFIG_TEMPLATE.replace("__ENV_BLOCK__", &env_block);
+    let purge_build_deps = match chroot_mode {
+        ChrootMode::Unshare => "always",
+        ChrootMode::Schroot => "never",
+    };
+
+    let config = SBUILD_CONFIG_TEMPLATE
+        .replace("__ENV_BLOCK__", &env_block)
+        .replace("__PURGE_BUILD_DEPS__", purge_build_deps);
 
     let mut file = tempfile::Builder::new()
         .prefix("rebuild-sbuild-")
@@ -681,5 +752,62 @@ mod tests {
         let log = "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n";
         let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(result.contains("wrapper setup FAILED"), "got: {result}");
+    }
+
+    // -- ChrootMode ---------------------------------------------------------
+
+    #[test]
+    fn chroot_mode_parse_unshare() {
+        let mode: ChrootMode = "unshare".parse().unwrap();
+        assert_eq!(mode, ChrootMode::Unshare);
+        assert_eq!(mode.as_str(), "unshare");
+        assert_eq!(format!("{mode}"), "unshare");
+    }
+
+    #[test]
+    fn chroot_mode_parse_schroot() {
+        let mode: ChrootMode = "schroot".parse().unwrap();
+        assert_eq!(mode, ChrootMode::Schroot);
+        assert_eq!(mode.as_str(), "schroot");
+        assert_eq!(format!("{mode}"), "schroot");
+    }
+
+    #[test]
+    fn chroot_mode_parse_invalid() {
+        assert!("docker".parse::<ChrootMode>().is_err());
+    }
+
+    // -- generate_sbuild_config purge behaviour -----------------------------
+
+    #[test]
+    fn sbuild_config_unshare_purges_deps_always() {
+        let file = generate_sbuild_config(4, false, &[], ChrootMode::Unshare).unwrap();
+        let config = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            config.contains("$purge_build_deps = 'always';"),
+            "unshare mode must purge deps always, got:\n{config}"
+        );
+        assert!(!config.contains("__PURGE_BUILD_DEPS__"));
+    }
+
+    #[test]
+    fn sbuild_config_schroot_purges_deps_never() {
+        let file = generate_sbuild_config(4, false, &[], ChrootMode::Schroot).unwrap();
+        let config = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            config.contains("$purge_build_deps = 'never';"),
+            "schroot mode must purge deps never, got:\n{config}"
+        );
+        assert!(!config.contains("__PURGE_BUILD_DEPS__"));
+    }
+
+    #[test]
+    fn sbuild_config_no_placeholders_remain() {
+        for mode in [ChrootMode::Unshare, ChrootMode::Schroot] {
+            let file = generate_sbuild_config(4, true, &[], mode).unwrap();
+            let config = std::fs::read_to_string(file.path()).unwrap();
+            assert!(!config.contains("__ENV_BLOCK__"), "mode {mode:?}: __ENV_BLOCK__ remains");
+            assert!(!config.contains("__PURGE_BUILD_DEPS__"), "mode {mode:?}: __PURGE_BUILD_DEPS__ remains");
+        }
     }
 }
