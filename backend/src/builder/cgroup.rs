@@ -22,6 +22,67 @@ impl Drop for BuildCgroup {
 }
 
 impl BuildCgroup {
+    /// Get the current process's real UID.
+    fn current_uid() -> Option<u32> {
+        let uid = nix::unistd::getuid().as_raw();
+        if uid == 0 {
+            // Running as root — the user@0.service path doesn't apply.
+            None
+        } else {
+            Some(uid)
+        }
+    }
+
+    /// Attempt to create a memory-limited child cgroup under `parent`.
+    ///
+    /// Tries: enable `+memory` in subtree_control, mkdir child, write memory.max.
+    /// Returns `Ok(Some(path))` on success, `Ok(None)` if this parent isn't
+    /// suitable (no memory controller, or not writable).  Cleans up partial
+    /// state on failure.
+    fn try_create_at(parent: &std::path::Path, child_name: &str, limit_bytes: u64) -> Result<Option<PathBuf>> {
+        debug!("Trying cgroup parent: {}", parent.display());
+
+        // Check if `memory` is available at this level.
+        let controllers = fs::read_to_string(parent.join("cgroup.controllers"))
+            .unwrap_or_default();
+        debug!("  cgroup.controllers: {:?}", controllers.trim());
+
+        if !controllers.split_whitespace().any(|c| c == "memory") {
+            debug!("  no memory controller, skipping to parent");
+            return Ok(None);
+        }
+
+        // Try to enable memory for children (no-op if already enabled).
+        let subtree_ctl = parent.join("cgroup.subtree_control");
+        match Self::cgroup_write(&subtree_ctl, "+memory") {
+            Ok(()) => debug!("  subtree_control +memory: OK"),
+            Err(e) => debug!("  subtree_control +memory: failed ({e})"),
+        }
+
+        // Try to create the child cgroup.
+        let child_path = parent.join(child_name);
+        match fs::create_dir(&child_path) {
+            Ok(()) => debug!("  mkdir child: OK at {}", child_path.display()),
+            Err(e) => {
+                debug!("  mkdir child: failed ({e}), skipping to parent");
+                return Ok(None);
+            }
+        }
+
+        // Try to set the memory limit.
+        match Self::cgroup_write(&child_path.join("memory.max"), &limit_bytes.to_string()) {
+            Ok(()) => {
+                debug!("  memory.max write: OK — cgroup ready at {}", child_path.display());
+                Ok(Some(child_path))
+            }
+            Err(e) => {
+                debug!("  memory.max write: failed ({e}), cleaning up and trying parent");
+                let _ = fs::remove_dir(&child_path);
+                Ok(None)
+            }
+        }
+    }
+
     /// Discover the current process's cgroup path by reading `/proc/self/cgroup`.
     /// Returns the cgroup v2 hierarchy path (e.g. `/user.slice/user-1000.slice/...`).
     fn read_cgroup_v2_path() -> Result<String> {
@@ -66,6 +127,13 @@ impl BuildCgroup {
     /// inside a terminal scope that doesn't have the memory controller delegated —
     /// it walks up to `user@UID.service` or `app.slice` where memory is already
     /// enabled.
+    ///
+    /// If the walk-up fails entirely (e.g. the process is in a session scope
+    /// directly under `user-UID.slice` without `user@UID.service` in the path,
+    /// which happens when the user manager isn't running or lingering isn't
+    /// enabled), falls back to trying the `user@UID.service` cgroup directory
+    /// directly — if `Delegate=yes` is configured there, it will be writable
+    /// even though it's not an ancestor of the current process.
     fn find_and_create_child(build_id: Uuid, memory_limit_mb: u64) -> Result<PathBuf> {
         let cgroup_path = Self::read_cgroup_v2_path()?;
         let full = PathBuf::from("/sys/fs/cgroup").join(&cgroup_path);
@@ -74,53 +142,31 @@ impl BuildCgroup {
 
         debug!("Searching for writable cgroup parent, starting from {}", full.display());
 
+        // Candidate 1: walk up from the current process's cgroup.
         let mut current = Some(full.as_path());
         while let Some(dir) = current {
-            debug!("Trying cgroup parent: {}", dir.display());
-
-            // Check if `memory` is available at this level.
-            let controllers = fs::read_to_string(dir.join("cgroup.controllers"))
-                .unwrap_or_default();
-            debug!("  cgroup.controllers: {:?}", controllers.trim());
-
-            if !controllers.split_whitespace().any(|c| c == "memory") {
-                debug!("  no memory controller, skipping to parent");
-                current = dir.parent();
-                continue;
+            if let Some(path) = Self::try_create_at(dir, &child_name, limit_bytes)? {
+                return Ok(path);
             }
+            current = dir.parent();
+        }
 
-            // Try to enable memory for children (no-op if already enabled).
-            let subtree_ctl = dir.join("cgroup.subtree_control");
-            match Self::cgroup_write(&subtree_ctl, "+memory") {
-                Ok(()) => debug!("  subtree_control +memory: OK"),
-                Err(e) => debug!("  subtree_control +memory: failed ({e})"),
-            }
-
-            // Try to create the child cgroup.
-            let child_path = dir.join(&child_name);
-            match fs::create_dir(&child_path) {
-                Ok(()) => debug!("  mkdir child: OK at {}", child_path.display()),
-                Err(e) => {
-                    debug!("  mkdir child: failed ({e}), skipping to parent");
-                    current = dir.parent();
-                    continue;
-                }
-            }
-
-            // Try to set the memory limit.
-            match Self::cgroup_write(&child_path.join("memory.max"), &limit_bytes.to_string()) {
-                Ok(()) => {
-                    debug!("  memory.max write: OK — cgroup ready at {}", child_path.display());
-                    return Ok(child_path);
-                }
-                Err(e) => {
-                    debug!("  memory.max write: failed ({e}), cleaning up and trying parent");
-                    let _ = fs::remove_dir(&child_path);
-                    current = dir.parent();
-                    continue;
+        // Candidate 2: try user@UID.service directly.  When the process is in
+        // a session scope under user-UID.slice (not under user@UID.service),
+        // the walk-up above never visits user@UID.service.  But if
+        // Delegate=yes is configured on user@UID.service, that directory is
+        // writable by the user even though it's not an ancestor.
+        if let Some(uid) = Self::current_uid() {
+            let user_service = PathBuf::from("/sys/fs/cgroup")
+                .join(format!("user.slice/user-{uid}.slice/user@{uid}.service"));
+            if user_service.exists() && !full.starts_with(&user_service) {
+                debug!("Trying fallback cgroup parent: {}", user_service.display());
+                if let Some(path) = Self::try_create_at(&user_service, &child_name, limit_bytes)? {
+                    return Ok(path);
                 }
             }
         }
+
         anyhow::bail!(
             "No writable cgroup parent with memory controller found \
              (walked up from {cgroup_path}). \
