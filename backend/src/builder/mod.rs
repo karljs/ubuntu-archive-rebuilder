@@ -1,10 +1,12 @@
 //! Build orchestration — runs a batch of package builds sequentially,
 //! recording results to the database and handling Ctrl+C gracefully.
 
+mod cgroup;
 mod sbuild;
 mod source;
 mod time_parser;
 
+pub use cgroup::BuildCgroup;
 pub use sbuild::{run_sbuild, SbuildConfig};
 pub use source::{fetch_source, SourcePackage};
 pub use time_parser::parse_time_output;
