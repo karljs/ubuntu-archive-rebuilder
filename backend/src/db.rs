@@ -18,6 +18,7 @@ const MIGRATION_003: &str = include_str!("../migrations/003_findings_class.sql")
 const MIGRATION_004: &str = include_str!("../migrations/004_build_log_blob.sql");
 const MIGRATION_005: &str = include_str!("../migrations/005_arch_and_component.sql");
 const MIGRATION_006: &str = include_str!("../migrations/006_repair_findings_fk.sql");
+const MIGRATION_007: &str = include_str!("../migrations/007_oom_retry_metadata.sql");
 
 /// Aggregate build counts for a batch.
 ///
@@ -36,6 +37,7 @@ pub struct BatchStats {
     pub failed: i64,
     pub dep_wait: i64,
     pub timeout: i64,
+    pub oom_killed: i64,
     /// Failed builds whose findings were all environmental (excluded from
     /// compiler comparison). Subset carved out of what would otherwise be `failed`.
     pub environmental: i64,
@@ -83,6 +85,9 @@ pub struct NewBuild<'a> {
     /// Archive component (main / universe / restricted / multiverse).
     /// `None` for legacy rows or bare-name package lists.
     pub component: Option<&'a str>,
+    pub attempt_number: i64,
+    pub jobs: Option<i64>,
+    pub memory_limit_mb: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +193,23 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .execute(&pool)
             .await
             .context("Failed to apply migration 006")?;
+    }
+
+    // Migration 007: add attempt_number, jobs, memory_limit_mb to builds
+    // and relax UNIQUE constraint to allow retry attempts.  Detected by
+    // checking for the attempt_number column.
+    let has_attempt_number: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('builds') WHERE name = 'attempt_number'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(false);
+
+    if !has_attempt_number {
+        sqlx::query(MIGRATION_007)
+            .execute(&pool)
+            .await
+            .context("Failed to apply migration 007")?;
     }
 
     Ok(pool)
@@ -350,8 +372,9 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         "INSERT INTO builds (
             id, batch_id, source_package, version, status,
             build_duration_seconds, peak_memory_mb,
-            build_log, compiler_detected, submitted_at, completed_at, component
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            build_log, compiler_detected, submitted_at, completed_at, component,
+            attempt_number, jobs, memory_limit_mb
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(b.batch_id.to_string())
@@ -360,11 +383,14 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
     .bind(b.status.as_str())
     .bind(b.build_duration_seconds)
     .bind(b.peak_memory_mb)
-    .bind(b.build_log.as_deref())   // Option<&[u8]> — NULL when not stored
+    .bind(b.build_log.as_deref())
     .bind(b.compiler_detected)
     .bind(b.submitted_at.to_rfc3339())
     .bind(b.completed_at.map(|d| d.to_rfc3339()))
     .bind(b.component)
+    .bind(b.attempt_number)
+    .bind(b.jobs)
+    .bind(b.memory_limit_mb)
     .execute(pool)
     .await
     .context("Failed to insert build")?;
@@ -377,11 +403,14 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         status: b.status,
         build_duration_seconds: b.build_duration_seconds,
         peak_memory_mb: b.peak_memory_mb,
-        build_log: None,   // never populated on insert path; use get_build_log()
+        build_log: None,
         compiler_detected: b.compiler_detected.map(|s| s.to_string()),
         submitted_at: b.submitted_at,
         completed_at: b.completed_at,
         component: b.component.map(|s| s.to_string()),
+        attempt_number: b.attempt_number,
+        jobs: b.jobs,
+        memory_limit_mb: b.memory_limit_mb,
     })
 }
 
@@ -391,8 +420,9 @@ pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<V
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
                 build_duration_seconds, peak_memory_mb,
-                compiler_detected, submitted_at, completed_at, component
-         FROM builds WHERE batch_id = ? ORDER BY submitted_at",
+                compiler_detected, submitted_at, completed_at, component,
+                attempt_number, jobs, memory_limit_mb
+         FROM builds WHERE batch_id = ? ORDER BY source_package, attempt_number",
     )
     .bind(batch_id.to_string())
     .fetch_all(pool)
@@ -409,7 +439,8 @@ pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
                 build_duration_seconds, peak_memory_mb,
-                compiler_detected, submitted_at, completed_at, component
+                compiler_detected, submitted_at, completed_at, component,
+                attempt_number, jobs, memory_limit_mb
          FROM builds ORDER BY submitted_at",
     )
     .fetch_all(pool)
@@ -474,6 +505,9 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
             .map(|s| DateTime::parse_from_rfc3339(&s).map(|d| d.with_timezone(&Utc)))
             .transpose()?,
         component: row.get("component"),
+        attempt_number: row.get("attempt_number"),
+        jobs: row.get("jobs"),
+        memory_limit_mb: row.get("memory_limit_mb"),
     })
 }
 
@@ -607,11 +641,12 @@ pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchS
             "failed" => stats.failed = count,
             "dep_wait" => stats.dep_wait = count,
             "timeout" => stats.timeout = count,
+            "oom_killed" => stats.oom_killed = count,
             _ => {}
         }
     }
     stats.total = stats.pending + stats.building + stats.succeeded
-        + stats.failed + stats.dep_wait + stats.timeout;
+        + stats.failed + stats.dep_wait + stats.timeout + stats.oom_killed;
 
     // Carve out "environmental" failures: failed builds that have at least one
     // finding and whose findings are *all* environmental. These are infra
@@ -684,6 +719,7 @@ mod tests {
         sqlx::query(MIGRATION_004).execute(&pool).await.expect("mig 004");
         sqlx::query(MIGRATION_005).execute(&pool).await.expect("mig 005");
         sqlx::query(MIGRATION_006).execute(&pool).await.expect("mig 006");
+        sqlx::query(MIGRATION_007).execute(&pool).await.expect("mig 007");
         pool
     }
 
@@ -792,6 +828,9 @@ mod tests {
                 submitted_at: now,
                 completed_at: Some(now),
                 component: Some("universe"),
+                attempt_number: 1,
+                jobs: None,
+                memory_limit_mb: None,
             },
         )
         .await
@@ -831,6 +870,9 @@ mod tests {
                 submitted_at: now,
                 completed_at: Some(now),
                 component: None,
+                attempt_number: 1,
+                jobs: None,
+                memory_limit_mb: None,
             },
         )
         .await
@@ -872,6 +914,9 @@ mod tests {
                 submitted_at: now,
                 completed_at: Some(now),
                 component: None,
+                attempt_number: 1,
+                jobs: None,
+                memory_limit_mb: None,
             },
         )
         .await
@@ -1003,6 +1048,9 @@ mod tests {
                 submitted_at: now,
                 completed_at: Some(now),
                 component: None,
+                attempt_number: 1,
+                jobs: None,
+                memory_limit_mb: None,
             },
         )
         .await
@@ -1019,6 +1067,204 @@ mod tests {
         )
         .await
         .expect("finding insert succeeds after repair");
+    }
+
+    #[tokio::test]
+    async fn migration_007_adds_oom_retry_columns() {
+        let pool = mem_pool().await;
+
+        let build_cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('builds') ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(build_cols.contains(&"attempt_number".to_string()), "builds.attempt_number missing");
+        assert!(build_cols.contains(&"jobs".to_string()), "builds.jobs missing");
+        assert!(build_cols.contains(&"memory_limit_mb".to_string()), "builds.memory_limit_mb missing");
+    }
+
+    #[tokio::test]
+    async fn migration_007_allows_multiple_attempts_for_same_package() {
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+
+        let now = Utc::now();
+
+        // Attempt 1: OOM-killed
+        insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "foo",
+                version: "1.0",
+                status: BuildStatus::OomKilled,
+                build_duration_seconds: None,
+                peak_memory_mb: Some(14000),
+                build_log: None,
+                compiler_detected: None,
+                submitted_at: now,
+                completed_at: Some(now),
+                component: Some("main"),
+                attempt_number: 1,
+                jobs: Some(8),
+                memory_limit_mb: Some(14336),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Attempt 2: succeeded at jobs=1 — must not violate UNIQUE
+        insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "foo",
+                version: "1.0",
+                status: BuildStatus::Succeeded,
+                build_duration_seconds: Some(120.0),
+                peak_memory_mb: Some(500),
+                build_log: None,
+                compiler_detected: Some("clang confirmed: 21"),
+                submitted_at: now,
+                completed_at: Some(now),
+                component: Some("main"),
+                attempt_number: 2,
+                jobs: Some(1),
+                memory_limit_mb: Some(14336),
+            },
+        )
+        .await
+        .unwrap();
+
+        let builds = get_builds_for_batch(&pool, batch.id).await.unwrap();
+        assert_eq!(builds.len(), 2);
+        assert_eq!(builds[0].attempt_number, 1);
+        assert_eq!(builds[0].status, BuildStatus::OomKilled);
+        assert_eq!(builds[1].attempt_number, 2);
+        assert_eq!(builds[1].status, BuildStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn migration_007_legacy_rows_get_defaults() {
+        // Stage a DB with the old schema (no attempt_number/jobs/memory_limit_mb),
+        // then run init() to apply migration 007, and verify defaults.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("rebuilder.db");
+
+        let staging = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+
+        // Stage with the pre-007 schema (no attempt_number/jobs/memory_limit_mb,
+        // old UNIQUE constraint).
+        pool_exec(
+            &staging,
+            r#"
+            CREATE TABLE batches (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                compiler_type TEXT NOT NULL,
+                compiler_version TEXT NOT NULL,
+                series TEXT NOT NULL,
+                profile_name TEXT NOT NULL,
+                profile_content TEXT NOT NULL,
+                builder_backend TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_batches_compiler ON batches(compiler_type, compiler_version);
+            CREATE INDEX IF NOT EXISTS idx_batches_series ON batches(series);
+            CREATE INDEX IF NOT EXISTS idx_batches_started ON batches(started_at);
+
+            CREATE TABLE builds (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL REFERENCES batches(id),
+                source_package TEXT NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                build_duration_seconds REAL,
+                peak_memory_mb INTEGER,
+                build_log BLOB,
+                compiler_detected TEXT,
+                submitted_at TEXT NOT NULL,
+                completed_at TEXT,
+                component TEXT,
+                UNIQUE(batch_id, source_package)
+            );
+            CREATE INDEX IF NOT EXISTS idx_builds_batch ON builds(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
+            CREATE INDEX IF NOT EXISTS idx_builds_package ON builds(source_package);
+
+            CREATE TABLE build_findings (
+                id TEXT PRIMARY KEY,
+                build_id TEXT NOT NULL REFERENCES builds(id),
+                category TEXT NOT NULL,
+                description TEXT NOT NULL,
+                excerpt TEXT NOT NULL,
+                line_number INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_findings_build ON build_findings(build_id);
+            CREATE INDEX IF NOT EXISTS idx_findings_category ON build_findings(category);
+            "#,
+        )
+        .await;
+        pool_exec(&staging, MIGRATION_002).await;
+        pool_exec(&staging, MIGRATION_003).await;
+        pool_exec(&staging, MIGRATION_004).await;
+        pool_exec(&staging, MIGRATION_005).await;
+        pool_exec(&staging, MIGRATION_006).await;
+
+        // Insert a legacy build row (old schema, no new columns).
+        let profile = sample_profile();
+        let batch = create_batch(&staging, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO builds (id, batch_id, source_package, version, status,
+             build_duration_seconds, peak_memory_mb, compiler_detected,
+             submitted_at, completed_at, component)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(batch.id.to_string())
+        .bind("legacy-pkg")
+        .bind("1.0")
+        .bind("succeeded")
+        .bind(42.0)
+        .bind(128)
+        .bind(None::<String>)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind::<Option<String>>(None)
+        .execute(&staging)
+        .await
+        .unwrap();
+        staging.close().await;
+
+        // Run init() — should apply migration 007.
+        let pool = init(&db_path).await.expect("init applies migration 007");
+
+        // Verify the legacy row got defaults.
+        let row = sqlx::query(
+            "SELECT attempt_number, jobs, memory_limit_mb FROM builds WHERE source_package = 'legacy-pkg'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let attempt: i64 = row.get("attempt_number");
+        let jobs: Option<i64> = row.get("jobs");
+        let mem_limit: Option<i64> = row.get("memory_limit_mb");
+        assert_eq!(attempt, 1);
+        assert_eq!(jobs, None);
+        assert_eq!(mem_limit, None);
     }
 
     async fn pool_exec(pool: &SqlitePool, sql: &str) {

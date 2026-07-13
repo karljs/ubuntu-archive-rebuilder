@@ -28,12 +28,15 @@ CREATE TABLE IF NOT EXISTS builds (
     status TEXT NOT NULL,
     build_duration_seconds REAL,
     peak_memory_mb INTEGER,
-    build_log TEXT,
+    build_log BLOB,
     compiler_detected TEXT,
     submitted_at TEXT NOT NULL,
     completed_at TEXT,
+    attempt_number INTEGER NOT NULL DEFAULT 1,
+    jobs INTEGER,
+    memory_limit_mb INTEGER,
 
-    UNIQUE(batch_id, source_package)
+    UNIQUE(batch_id, source_package, attempt_number)
 );
 
 CREATE INDEX IF NOT EXISTS idx_builds_batch ON builds(batch_id);

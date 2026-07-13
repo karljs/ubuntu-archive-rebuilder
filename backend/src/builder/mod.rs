@@ -1,10 +1,12 @@
 //! Build orchestration — runs a batch of package builds sequentially,
 //! recording results to the database and handling Ctrl+C gracefully.
 
+mod cgroup;
 mod sbuild;
 mod source;
 mod time_parser;
 
+pub use cgroup::BuildCgroup;
 pub use sbuild::{run_sbuild, SbuildConfig};
 pub use source::{fetch_source, SourcePackage};
 pub use time_parser::parse_time_output;
@@ -41,6 +43,8 @@ pub struct BuildConfig {
     pub source_dir: PathBuf,
     /// Target build architecture.  Passed to sbuild as `--arch=<arch>`.
     pub arch: String,
+    /// Memory limit for the build cgroup, in MiB.  0 means no limit.
+    pub memory_limit_mb: u64,
 }
 
 /// Run a batch of builds, recording each result to the database.
@@ -82,6 +86,22 @@ pub async fn run_batch(
         cancel_signal.cancel();
     });
 
+    // Verify cgroup v2 availability for memory limiting. If unavailable,
+    // builds run without protection (graceful degradation).
+    if config.memory_limit_mb > 0 {
+        match std::fs::read_to_string("/proc/self/cgroup") {
+            Ok(content) => {
+                let has_v2 = content.lines().any(|l| l.starts_with("0::"));
+                if !has_v2 {
+                    warn!("Cgroup v2 not available. Builds will run without memory protection.");
+                }
+            }
+            Err(e) => {
+                warn!("Cannot read /proc/self/cgroup: {e}. Builds will run without memory protection.");
+            }
+        }
+    }
+
     let total = config.packages.len();
     for (idx, (package_name, component)) in config.packages.iter().enumerate() {
         if cancel_token.is_cancelled() {
@@ -92,28 +112,56 @@ pub async fn run_batch(
         let progress = format!("[{}/{}]", idx + 1, total);
         info!("{progress} Building {package_name}");
 
-        match build_package(package_name, component.as_deref(), config, cancel_token.clone()).await {
-            Ok(result) => {
-                info!("{progress} {package_name} completed: {}", result.status.as_str());
-                store_build_result(pool, batch.id, &result, config).await?;
-            }
-            Err(e) => {
-                if e.to_string().contains("Interrupted by user") || cancel_token.is_cancelled() {
-                    info!("Batch interrupted by user, aborting remaining builds");
+        let mut attempt: u32 = 1;
+        let mut current_jobs = config.jobs;
+
+        loop {
+            match build_package(
+                package_name,
+                component.as_deref(),
+                config,
+                current_jobs,
+                attempt,
+                cancel_token.clone(),
+            )
+            .await
+            {
+                Ok(result) => {
+                    info!("{progress} {package_name} completed (attempt {attempt}): {}", result.status.as_str());
+                    let status = result.status;
+                    store_build_result(pool, batch.id, &result, config).await?;
+
+                    // Retry only if OOM-killed on first attempt with jobs > 1.
+                    if status == BuildStatus::OomKilled && attempt == 1 && current_jobs > 1 {
+                        info!("{progress} {package_name} OOM-killed at {current_jobs} jobs, retrying at 1 job");
+                        attempt = 2;
+                        current_jobs = 1;
+                        continue;
+                    }
                     break;
                 }
-                error!("{progress} {package_name} failed to run: {e}");
-                let error_result = BuildResult {
-                    source_package: package_name.clone(),
-                    version: "unknown".into(),
-                    status: BuildStatus::Failed,
-                    build_duration_seconds: None,
-                    peak_memory_mb: None,
-                    build_log: format!("Build failed to execute: {e}"),
-                    compiler_detected: None,
-                    component: component.clone(),
-                };
-                store_build_result(pool, batch.id, &error_result, config).await?;
+                Err(e) => {
+                    if e.to_string().contains("Interrupted by user") || cancel_token.is_cancelled() {
+                        info!("Batch interrupted by user, aborting remaining builds");
+                        break;
+                    }
+                    error!("{progress} {package_name} failed to run: {e}");
+                    let error_result = BuildResult {
+                        source_package: package_name.clone(),
+                        version: "unknown".into(),
+                        status: BuildStatus::Failed,
+                        build_duration_seconds: None,
+                        peak_memory_mb: None,
+                        build_log: format!("Build failed to execute: {e}"),
+                        compiler_detected: None,
+                        component: component.clone(),
+                        jobs: current_jobs,
+                        memory_limit_mb: None,
+                        attempt_number: attempt,
+                    };
+                    store_build_result(pool, batch.id, &error_result, config).await?;
+                    break;
+                }
             }
         }
     }
@@ -137,6 +185,8 @@ async fn build_package(
     package_name: &str,
     component: Option<&str>,
     config: &BuildConfig,
+    jobs: usize,
+    attempt: u32,
     cancel_token: CancellationToken,
 ) -> Result<BuildResult> {
     // Use a temp dir on real disk (not the RAM-backed /tmp tmpfs) to avoid
@@ -162,8 +212,9 @@ async fn build_package(
         timeout_seconds: config.timeout_seconds,
         verbose: config.verbose,
         run_tests: config.run_tests,
-        jobs: config.jobs,
+        jobs,
         cancel_token,
+        memory_limit_mb: config.memory_limit_mb,
     };
 
     let result = run_sbuild(&sbuild_config).await?;
@@ -189,6 +240,9 @@ async fn build_package(
         build_log: result.log,
         compiler_detected: result.compiler_detected,
         component: component.map(|s| s.to_string()),
+        jobs,
+        memory_limit_mb: result.memory_limit_mb,
+        attempt_number: attempt,
     })
 }
 
@@ -235,6 +289,9 @@ async fn store_build_result(
             submitted_at: now,
             completed_at: Some(now),
             component: result.component.as_deref(),
+            attempt_number: result.attempt_number as i64,
+            jobs: Some(result.jobs as i64),
+            memory_limit_mb: result.memory_limit_mb.map(|v| v as i64),
         },
     )
     .await?;

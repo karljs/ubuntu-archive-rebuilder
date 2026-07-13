@@ -14,6 +14,7 @@ pub enum BuildStatus {
     Failed,
     DepWait,
     Timeout,
+    OomKilled,
 }
 
 impl BuildStatus {
@@ -25,12 +26,13 @@ impl BuildStatus {
             Self::Failed => "failed",
             Self::DepWait => "dep_wait",
             Self::Timeout => "timeout",
+            Self::OomKilled => "oom_killed",
         }
     }
 
     /// Returns true if the build has reached a final state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::DepWait | Self::Timeout)
+        matches!(self, Self::Succeeded | Self::Failed | Self::DepWait | Self::Timeout | Self::OomKilled)
     }
 
     /// Returns true if the build log should be scanned for error-level findings.
@@ -59,6 +61,7 @@ impl std::str::FromStr for BuildStatus {
             "failed" => Ok(Self::Failed),
             "dep_wait" => Ok(Self::DepWait),
             "timeout" => Ok(Self::Timeout),
+            "oom_killed" => Ok(Self::OomKilled),
             other => Err(format!("unknown build status: {other}")),
         }
     }
@@ -228,6 +231,9 @@ pub struct Build {
     /// restricted / multiverse).  `None` for legacy rows and bare-name
     /// package lists that did not carry component metadata.
     pub component: Option<String>,
+    pub attempt_number: i64,
+    pub jobs: Option<i64>,
+    pub memory_limit_mb: Option<i64>,
 }
 
 /// An error finding or observation from build-log analysis.
@@ -256,6 +262,9 @@ pub struct BuildResult {
     /// Archive component the source package belongs to, if known from the
     /// package list.  Forwarded to `NewBuild` for persistence.
     pub component: Option<String>,
+    pub jobs: usize,
+    pub memory_limit_mb: Option<u64>,
+    pub attempt_number: u32,
 }
 
 /// How build logs are stored.
@@ -303,4 +312,40 @@ pub struct ResourceMetrics {
     pub system_time_seconds: Option<f64>,
     pub peak_memory_kb: Option<i64>,
     pub exit_status: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oom_killed_is_terminal() {
+        assert!(BuildStatus::OomKilled.is_terminal());
+    }
+
+    #[test]
+    fn oom_killed_as_str() {
+        assert_eq!(BuildStatus::OomKilled.as_str(), "oom_killed");
+    }
+
+    #[test]
+    fn oom_killed_from_str() {
+        let status: BuildStatus = "oom_killed".parse().unwrap();
+        assert_eq!(status, BuildStatus::OomKilled);
+    }
+
+    #[test]
+    fn oom_killed_display() {
+        assert_eq!(format!("{}", BuildStatus::OomKilled), "oom_killed");
+    }
+
+    #[test]
+    fn oom_killed_does_not_scan_for_errors() {
+        assert!(!BuildStatus::OomKilled.should_scan_for_errors());
+    }
+
+    #[test]
+    fn oom_killed_does_not_scan_for_observations() {
+        assert!(!BuildStatus::OomKilled.should_scan_for_observations());
+    }
 }
