@@ -18,10 +18,12 @@ var profileConfigMap = {};
 // Compare tab state: ordered list of selected batch IDs
 var compareSelectedIds = [];
 
-// Known Ubuntu series in release order
-var SERIES_ORDER = ['focal','groovy','hirsute','impish','jammy','kinetic',
-                    'lunar','mantic','noble','oracular','plucky','questing',
-                    'resolute','stonking'];
+// Series release order, from export_meta.series_order (written by the
+// backend from distro-info). Empty on legacy exports: first-seen fallback.
+var seriesOrder = [];
+
+// True when batches span more than one arch; arch then appears in labels.
+var multiArch = false;
 
 // ════════════════════════════════════════════════
 // Bootstrap
@@ -75,6 +77,13 @@ function probeExportSchema() {
         exportHas.exportMeta = dbQuery(
             "SELECT COUNT(*) AS n FROM pragma_table_info('export_meta')"
         )[0].n > 0;
+        if (exportHas.exportMeta) {
+            var row = dbQuery("SELECT value FROM export_meta WHERE key = 'series_order'")[0];
+            if (row) {
+                var parsed = JSON.parse(row.value);
+                if (Array.isArray(parsed)) seriesOrder = parsed;
+            }
+        }
     } catch (e) {
         console.warn('schema probe failed, assuming legacy export:', e);
     }
@@ -151,9 +160,10 @@ function loadData() {
         } catch(e) { /* retried stays 0 */ }
     }
 
+    var batchCols = "id, name, compiler_type, compiler_version, series, profile_name, started_at, finished_at";
+    if (exportHas.arch) batchCols += ", arch";
     batches = dbQuery(
-        "SELECT id, name, compiler_type, compiler_version, series, profile_name, started_at, finished_at " +
-        "FROM batches ORDER BY started_at DESC"
+        "SELECT " + batchCols + " FROM batches ORDER BY started_at DESC"
     ).map(function(row) {
         var b = {
             id: row.id,
@@ -161,6 +171,7 @@ function loadData() {
             compiler_type: row.compiler_type,
             compiler_version: row.compiler_version,
             series: row.series,
+            arch: row.arch || null,
             profile_name: row.profile_name,
             started_at: row.started_at,
             finished_at: row.finished_at,
@@ -169,6 +180,19 @@ function loadData() {
         b.config = configFor(b);
         return b;
     });
+
+    if (seriesOrder.length === 0) {
+        // First-seen order (earliest batch started_at per series), oldest left.
+        var firstSeen = {};
+        batches.forEach(function(b) {
+            if (!firstSeen[b.series] || b.started_at < firstSeen[b.series]) firstSeen[b.series] = b.started_at;
+        });
+        seriesOrder = Object.keys(firstSeen).sort(function(a, b) { return firstSeen[a] < firstSeen[b] ? -1 : 1; });
+    }
+
+    var archSet = {};
+    batches.forEach(function(b) { archSet[b.arch || ''] = true; });
+    multiArch = Object.keys(archSet).length > 1;
 
     populateDetailsBatchSelector();
     populateStatusFilter();
@@ -309,29 +333,35 @@ function renderOverview() {
         return;
     }
 
-    // Row keys: "compiler_type compiler_version", sorted clang-first then numeric.
+    // Row keys: compiler_type alphabetically, then natural version order
+    // ("9" < "10" < "2.28"). No compiler list is hardcoded.
     var rowSet = {};
     batches.forEach(function(b) { rowSet[b.compiler_type + ' ' + b.compiler_version] = true; });
     var rows = Object.keys(rowSet).sort(function(a, b) {
         var aP = a.split(' '), bP = b.split(' ');
-        var typeOrd = { clang: 0, gcc: 1 };
-        var td = (typeOrd[aP[0]] !== undefined ? typeOrd[aP[0]] : 99) -
-                 (typeOrd[bP[0]] !== undefined ? typeOrd[bP[0]] : 99);
-        return td !== 0 ? td : parseFloat(aP[1]) - parseFloat(bP[1]);
+        var td = aP[0].localeCompare(bP[0]);
+        return td !== 0 ? td : compareVersions(aP[1], bP[1]);
     });
 
-    // Column keys: unique series sorted by release order.
-    var seriesSet = {};
-    batches.forEach(function(b) { seriesSet[b.series] = true; });
-    var cols = Object.keys(seriesSet).sort(function(a, b) {
-        var ai = SERIES_ORDER.indexOf(a), bi = SERIES_ORDER.indexOf(b);
-        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
-    });
-
-    // Group batches by (compilerKey, series, profile_name) — pick largest-N per profile.
-    var cellProfiles = {}; // "compilerKey\0series" -> { profile_name -> best_batch }
+    // Columns: one per series, or per (series, arch) when the data spans
+    // multiple arches. Ordered by series release order from export_meta.
+    var colMap = {};
     batches.forEach(function(b) {
-        var cellKey = b.compiler_type + ' ' + b.compiler_version + '\x00' + b.series;
+        var ck = b.series + (multiArch ? '\x01' + (b.arch || '') : '');
+        if (!colMap[ck]) colMap[ck] = true;
+    });
+    var cols = Object.keys(colMap).sort(function(x, y) {
+        var xs = x.split('\x01')[0], ys = y.split('\x01')[0];
+        var xi = seriesOrder.indexOf(xs), yi = seriesOrder.indexOf(ys);
+        var d = (xi === -1 ? seriesOrder.length : xi) - (yi === -1 ? seriesOrder.length : yi);
+        return d !== 0 ? d : x.localeCompare(y);
+    });
+
+    // Group batches by (compilerKey, column, profile_name); largest-N per profile.
+    var cellProfiles = {};
+    batches.forEach(function(b) {
+        var colKey = b.series + (multiArch ? '\x01' + (b.arch || '') : '');
+        var cellKey = b.compiler_type + ' ' + b.compiler_version + '\x00' + colKey;
         if (!cellProfiles[cellKey]) cellProfiles[cellKey] = {};
         var prev = cellProfiles[cellKey][b.profile_name];
         if (!prev || b.stats.total > prev.stats.total ||
@@ -342,13 +372,17 @@ function renderOverview() {
 
     var html = '<table class="matrix-table"><thead><tr>';
     html += '<th class="matrix-corner">Compiler</th>';
-    cols.forEach(function(s) { html += '<th class="matrix-series-header">' + escapeHtml(s) + '</th>'; });
+    cols.forEach(function(ck) {
+        var parts = ck.split('\x01');
+        var label = parts[0] + (parts[1] !== undefined ? ' · ' + (parts[1] || '?') : '');
+        html += '<th class="matrix-series-header">' + escapeHtml(label) + '</th>';
+    });
     html += '</tr></thead><tbody>';
 
     rows.forEach(function(rk) {
         html += '<tr><td class="matrix-row-label">' + escapeHtml(rk) + '</td>';
-        cols.forEach(function(series) {
-            var cellKey = rk + '\x00' + series;
+        cols.forEach(function(ck) {
+            var cellKey = rk + '\x00' + ck;
             var profileMap = cellProfiles[cellKey];
             if (!profileMap || Object.keys(profileMap).length === 0) {
                 html += '<td class="matrix-cell matrix-cell-empty"></td>';
@@ -401,7 +435,7 @@ function populateDetailsBatchSelector() {
         var rate = Math.round(successRate(b.stats));
         return {
             value: b.id,
-            label: b.profile_name + ' · ' + b.series + '  (' + rate + '%, N=' + comparableTotal(b.stats) + ')'
+            label: batchLabel(b) + '  (' + rate + '%, N=' + comparableTotal(b.stats) + ')'
         };
     });
     setDropdownOptions('details-batch-dd', opts);
@@ -575,11 +609,12 @@ function renderProfileComparison() {
     if (!panel || !currentBatch) return;
 
     var b = currentBatch;
-    // Find all batches with same compiler_type, compiler_version, series (sibling profiles).
+    // Sibling profiles: same compiler, series, and arch.
     var siblings = batches.filter(function(s) {
         return s.compiler_type    === b.compiler_type &&
                s.compiler_version === b.compiler_version &&
-               s.series           === b.series;
+               s.series           === b.series &&
+               s.arch             === b.arch;
     });
 
     // Group by profile_name, pick largest-N per profile.
@@ -652,10 +687,10 @@ function renderVersionContext() {
     var b = currentBatch;
     var summary = b.config.flag_summary;
 
-    // Find all batches with same series, same flag_summary, same compiler_type.
-    // Group by compiler_version, pick largest-N per version.
+    // Same series, arch, flag config, and compiler type; grouped by version.
     var related = batches.filter(function(s) {
         return s.series === b.series &&
+               s.arch === b.arch &&
                s.config.flag_summary === summary &&
                s.compiler_type === b.compiler_type;
     });
@@ -670,7 +705,7 @@ function renderVersionContext() {
         }
     });
 
-    var versions = Object.keys(verMap).sort(function(a, b) { return parseFloat(a) - parseFloat(b); });
+    var versions = Object.keys(verMap).sort(compareVersions);
 
     if (versions.length < 2) {
         panel.classList.add('hidden');
@@ -854,7 +889,7 @@ function renderCompareBatchList() {
 
     var html = '';
     batches.forEach(function(b) {
-        var label = b.profile_name + ' · ' + b.series;
+        var label = batchLabel(b);
         if (filter && label.toLowerCase().indexOf(filter) === -1) return;
         var rate = Math.round(successRate(b.stats));
         var checked = compareSelectedIds.indexOf(b.id) !== -1;
@@ -945,8 +980,8 @@ function renderCompareTable() {
     var colW = Math.max(80, Math.floor(600 / selectedBatches.length));
     var headerHtml = '<th>Package</th>';
     selectedBatches.forEach(function(b) {
-        var label = b.profile_name + '<br><span class="compare-col-series">' + escapeHtml(b.series) + ' · ' + escapeHtml(b.config.flag_summary) + '</span>';
-        headerHtml += '<th class="compare-col-batch" style="min-width:' + colW + 'px" title="' + escapeAttr(b.profile_name + ' · ' + b.series) + '">' + label + '</th>';
+        var label = escapeHtml(b.profile_name) + '<br><span class="compare-col-series">' + escapeHtml(b.series + (multiArch && b.arch ? ' · ' + b.arch : '') + ' · ' + b.config.flag_summary) + '</span>';
+        headerHtml += '<th class="compare-col-batch" style="min-width:' + colW + 'px" title="' + escapeAttr(batchLabel(b)) + '">' + label + '</th>';
     });
     headerHtml += '<th class="actions-col">Log</th>';
 
@@ -1027,7 +1062,7 @@ function renderResourceComparison(batchData, selectedBatches) {
 
     // Build column headers — short label per batch.
     var colHeaders = selectedBatches.map(function(b) {
-        return escapeHtml(b.profile_name + ' · ' + b.series);
+        return escapeHtml(batchLabel(b));
     });
 
     // Collect all packages that have resource data in at least one batch.
@@ -1275,14 +1310,26 @@ function renderLog(text, searchTerm) {
     if (!lc) return;
     var lines = text.split('\n');
     var numWidth = String(lines.length).length;
+    var term = searchTerm ? searchTerm.toLowerCase() : null;
     var hitCount = 0;
     var html = '';
     for (var i = 0; i < lines.length; i++) {
         var num = String(i + 1).padStart(numWidth);
-        var content = escapeHtml(lines[i]);
-        if (searchTerm) {
-            var re = new RegExp(escapeRegex(escapeHtml(searchTerm)), 'gi');
-            content = content.replace(re, function(m) { hitCount++; return '<span class="search-hit">' + m + '</span>'; });
+        // Highlight on the raw line, escape each chunk separately: matching
+        // against escaped text would break on terms containing & < >.
+        var content;
+        if (term) {
+            var lower = lines[i].toLowerCase();
+            var out = '', pos = 0, idx;
+            while ((idx = lower.indexOf(term, pos)) !== -1) {
+                hitCount++;
+                out += escapeHtml(lines[i].substring(pos, idx)) +
+                    '<span class="search-hit">' + escapeHtml(lines[i].substring(idx, idx + term.length)) + '</span>';
+                pos = idx + term.length;
+            }
+            content = out + escapeHtml(lines[i].substring(pos));
+        } else {
+            content = escapeHtml(lines[i]);
         }
         html += '<div class="log-line"><span class="line-num">' + num + '</span><span class="line-text">' + content + '</span></div>';
     }
@@ -1297,9 +1344,14 @@ function renderLog(text, searchTerm) {
     }
 }
 
+var logSearchTimer = null;
 function handleLogSearch() {
-    var ls = el('log-search');
-    renderLog(currentLogText, ls && ls.value.trim() || null);
+    if (logSearchTimer) clearTimeout(logSearchTimer);
+    logSearchTimer = setTimeout(function() {
+        logSearchTimer = null;
+        var ls = el('log-search');
+        renderLog(currentLogText, ls && ls.value.trim() || null);
+    }, 150);
 }
 
 // ════════════════════════════════════════════════
@@ -1343,6 +1395,31 @@ function dbQuery(sql, params) {
 }
 
 function unique(arr) { return arr.filter(function(v, i, a) { return a.indexOf(v) === i; }); }
+
+// Natural version order: numeric runs compare numerically ("9" < "10",
+// "2.9" < "2.28"), everything else lexically.
+function compareVersions(a, b) {
+    var ai = String(a).split(/(\d+)/), bi = String(b).split(/(\d+)/);
+    for (var i = 1; i < Math.max(ai.length, bi.length); i += 2) {
+        var x = ai[i], y = bi[i];
+        if (x === undefined || y === undefined) return ai.length - bi.length;
+        var d = parseInt(x, 10) - parseInt(y, 10);
+        if (d) return d;
+        var p = ai[i + 1], q = bi[i + 1];
+        if (p !== q) return (p || '') < (q || '') ? -1 : 1;
+    }
+    return 0;
+}
+
+// Label for a batch in selectors and table headers: profile, series, arch
+// (arch only when the data spans multiple).
+function batchLabel(b) {
+    return b.profile_name + ' · ' + b.series + (multiArch && b.arch ? ' · ' + b.arch : '');
+}
+
+function cssAttrEscape(s) {
+    return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
 
 function configFor(batch) {
     return profileConfigMap[batch.profile_name] ||
@@ -1404,8 +1481,6 @@ function escapeAttr(text) {
     return String(text).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;');
 }
 
-function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
 function fmtDelta(delta, fmt, threshold) {
     if (delta == null) return '<span class="delta-same">-</span>';
     var abs = Math.abs(delta);
@@ -1455,7 +1530,7 @@ function setDropdownValue(containerId, value) {
     if (!dd) return;
     var menu = dd.querySelector('.dropdown-menu');
     var toggle = dd.querySelector('.dropdown-toggle');
-    var li = menu ? menu.querySelector('li[data-value="' + escapeAttr(value) + '"]') : null;
+    var li = menu ? menu.querySelector('li[data-value="' + cssAttrEscape(value) + '"]') : null;
     if (li) {
         toggle.textContent = li.textContent;
         dd.dataset.value = value;
