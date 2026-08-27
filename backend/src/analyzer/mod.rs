@@ -287,12 +287,6 @@ pub fn infer_status(log: &str, exit_code: Option<i32>) -> BuildStatus {
     BuildStatus::Failed
 }
 
-#[allow(deprecated)]
-#[deprecated(note = "use infer_status(log, None) instead")]
-pub fn infer_status_from_log(log: &str) -> BuildStatus {
-    infer_status(log, None)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

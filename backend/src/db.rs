@@ -403,7 +403,6 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
         status: b.status,
         build_duration_seconds: b.build_duration_seconds,
         peak_memory_mb: b.peak_memory_mb,
-        build_log: None,
         compiler_detected: b.compiler_detected.map(|s| s.to_string()),
         submitted_at: b.submitted_at,
         completed_at: b.completed_at,
@@ -414,8 +413,8 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
     })
 }
 
-/// Get all builds for a batch.  The `build_log` field is always `None` here;
-/// use `get_build_log()` when the log content is actually needed.
+/// Get all builds for a batch.  Log content is not loaded; use
+/// `get_build_log()` when it is actually needed.
 pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
@@ -434,7 +433,7 @@ pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<V
 }
 
 /// Fetch all builds across all batches, ordered by submission time.
-/// The `build_log` field is always `None`; use `get_build_log()` when needed.
+/// Log content is not loaded; use `get_build_log()` when needed.
 pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
@@ -498,7 +497,6 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
             .map_err(|e: String| anyhow::anyhow!(e))?,
         build_duration_seconds: row.get("build_duration_seconds"),
         peak_memory_mb: row.get("peak_memory_mb"),
-        build_log: None,   // not selected; use get_build_log() when needed
         compiler_detected: row.get("compiler_detected"),
         submitted_at: DateTime::parse_from_rfc3339(&submitted_str)?.with_timezone(&Utc),
         completed_at: completed_str

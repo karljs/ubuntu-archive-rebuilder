@@ -6,7 +6,6 @@ mod sbuild;
 mod source;
 mod time_parser;
 
-pub use cgroup::BuildCgroup;
 pub use sbuild::{run_sbuild, ChrootMode, SbuildConfig};
 pub use source::{fetch_source, SourcePackage};
 pub use time_parser::parse_time_output;

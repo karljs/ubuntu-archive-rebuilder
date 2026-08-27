@@ -223,7 +223,8 @@ pub struct Build {
     pub status: BuildStatus,
     pub build_duration_seconds: Option<f64>,
     pub peak_memory_mb: Option<i64>,
-    pub build_log: Option<String>,
+    /// Log content is not carried on this struct — it can be gigabytes.
+    /// Use `db::get_build_log()` to fetch and decompress a single build's log.
     pub compiler_detected: Option<String>,
     pub submitted_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
