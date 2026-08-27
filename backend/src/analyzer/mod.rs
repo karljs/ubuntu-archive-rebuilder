@@ -241,8 +241,18 @@ fn extract_context(lines: &[&str], line_idx: usize, context: usize) -> String {
 /// `exit_code` should be the exit status of the build process when known.
 /// A non-zero exit code prevents a success determination even when a success
 /// marker is present in the log, guarding against partial logs.
+///
+/// Strong success markers ("Build finished successfully", binary-only upload)
+/// are trusted with or without a known exit code.  The weak heuristic
+/// ("dpkg-deb: building package" with no error markers) additionally requires
+/// a confirmed `Some(0)` exit: an unknown exit code (killed process, crashed
+/// wrapper) means debs on disk prove nothing about how the build ended.
 pub fn infer_status(log: &str, exit_code: Option<i32>) -> BuildStatus {
-    if log.contains("Build killed") || log.contains("Timed out") {
+    // sbuild's timeout message is "Build killed with signal ...".  Matching a
+    // bare "timed out" misfires on test-suite output ("panic: test timed
+    // out" in Go tests, autotest harnesses etc.) and would mislabel those
+    // failures as timeouts.
+    if log.contains("Build killed") {
         return BuildStatus::Timeout;
     }
 
@@ -253,15 +263,23 @@ pub fn infer_status(log: &str, exit_code: Option<i32>) -> BuildStatus {
         return BuildStatus::DepWait;
     }
 
-    let clean_exit = exit_code.map_or(true, |c| c == 0);
+    let strong_success = log.contains("Build finished successfully")
+        || log.contains("dpkg-buildpackage: info: binary-only upload");
 
-    if clean_exit
-        && (log.contains("Build finished successfully")
-            || log.contains("dpkg-buildpackage: info: binary-only upload")
-            || (log.contains("dpkg-deb: building package")
-                && !log.contains("error:")
-                && !log.contains("FAILED")
-                && !log.contains("Build failure")))
+    if strong_success {
+        // Non-zero exit overrides even a strong marker (partial log guard).
+        return if exit_code.map_or(true, |c| c == 0) {
+            BuildStatus::Succeeded
+        } else {
+            BuildStatus::Failed
+        };
+    }
+
+    if exit_code == Some(0)
+        && log.contains("dpkg-deb: building package")
+        && !log.contains("error:")
+        && !log.contains("FAILED")
+        && !log.contains("Build failure")
     {
         return BuildStatus::Succeeded;
     }
@@ -469,5 +487,39 @@ mod tests {
     #[test]
     fn infer_status_nonzero_exit_suppresses_success() {
         assert_eq!(infer_status("Build finished successfully", Some(1)), BuildStatus::Failed);
+    }
+
+    #[test]
+    fn infer_status_unknown_exit_rejects_weak_success_marker() {
+        // Regression: an unknown exit code (process killed by an unmonitored
+        // signal, crashed wrapper) must not satisfy the weak "dpkg-deb:
+        // building package" heuristic — debs on disk prove nothing about how
+        // the build ended.
+        let log = "dpkg-deb: building package 'hello'\ndpkg-deb: building package 'hello-dbgsym'";
+        assert_eq!(infer_status(log, None), BuildStatus::Failed);
+        // The same log with a confirmed clean exit is a success.
+        assert_eq!(infer_status(log, Some(0)), BuildStatus::Succeeded);
+    }
+
+    #[test]
+    fn infer_status_unknown_exit_accepts_strong_success_marker() {
+        // Strong markers are trusted without a known exit code.
+        assert_eq!(
+            infer_status("Build finished successfully", None),
+            BuildStatus::Succeeded
+        );
+        assert_eq!(
+            infer_status("dpkg-buildpackage: info: binary-only upload", None),
+            BuildStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn infer_status_test_suite_timed_out_is_not_timeout() {
+        // Regression: "test timed out" from a package's test suite must not
+        // be classified as a build timeout.
+        let log = "--- FAIL: TestFoo\npanic: test timed out after 30s\nFAIL";
+        assert_eq!(infer_status(log, Some(1)), BuildStatus::Failed);
+        assert_ne!(infer_status(log, None), BuildStatus::Timeout);
     }
 }
