@@ -319,6 +319,14 @@ body {
     margin-left: 4px; font-size: 12px;
 }
 
+/* Archive component tag (main / universe / ...) */
+.comp-tag {
+    color: var(--text-3); font-size: 10px; font-family: var(--mono);
+    border: 1px solid var(--border); border-radius: 2px;
+    padding: 0 3px; margin-left: 4px; vertical-align: 1px;
+    white-space: nowrap;
+}
+
 /* ════════════════════════════════════════════════
    Tables (shared)
    ════════════════════════════════════════════════ */
@@ -355,7 +363,12 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 #builds-table .col-issues   { width: 52px; }
 #builds-table .col-actions  { width: 88px; }
 /* Truncate package names that are too long */
-#builds-table td:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Truncate long package names; badges/tags after the name stay visible. */
+#builds-table td:first-child { white-space: nowrap; }
+#builds-table td:first-child .pkg-name {
+    display: inline-block; vertical-align: bottom; max-width: 170px;
+    overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ── Status indicators ── */
 .st { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 500; }

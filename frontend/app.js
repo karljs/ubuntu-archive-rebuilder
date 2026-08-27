@@ -202,10 +202,11 @@ function loadData() {
 }
 
 function loadBatchData(batchId) {
-    // Legacy exports lack attempt_number/jobs; probe before selecting them.
+    // Legacy exports lack attempt_number/jobs/component; probe before selecting.
     var cols = "b.id, b.source_package AS package, b.version, b.status, " +
         "b.build_duration_seconds AS duration_seconds, b.peak_memory_mb";
     if (exportHas.attemptNumber) cols += ", b.attempt_number, b.jobs";
+    if (exportHas.component) cols += ", b.component";
     var finalWhere = exportHas.attemptNumber ? " AND " + FINAL_ATTEMPT_WHERE : "";
     var buildRows = dbQuery(
         "SELECT " + cols + " FROM builds b WHERE b.batch_id = ?" + finalWhere + " ORDER BY b.source_package",
@@ -267,6 +268,7 @@ function loadBatchData(batchId) {
                 id: row.id, package: row.package, version: row.version,
                 status: row.status, duration_seconds: row.duration_seconds,
                 peak_memory_mb: row.peak_memory_mb,
+                component: row.component || null,
                 attempt_number: row.attempt_number || 1,
                 jobs: row.jobs,
                 retries: retries,
@@ -484,9 +486,27 @@ function renderDetailsContext() {
     var flags = parseFlagsJson(b.config.flags_json);
     var flagStr = flags.length === 0 ? 'no extra flags'
         : unique(flags.map(function(f) { return f.flag; })).join(', ');
+    var compStr = '';
+    if (currentBatchData) {
+        var counts = {};
+        var known = 0;
+        currentBatchData.builds.forEach(function(bld) {
+            if (!bld.component) return;
+            counts[bld.component] = (counts[bld.component] || 0) + 1;
+            known++;
+        });
+        var unknown = currentBatchData.builds.length - known;
+        if (known > 0) {
+            compStr = Object.keys(counts).sort().map(function(c) {
+                return c + ':' + counts[c];
+            }).join(' ');
+            if (unknown > 0) compStr += ' (+' + unknown + ' unknown)';
+            compStr = ' · ' + compStr;
+        }
+    }
     ctx.textContent = b.compiler_type + ' ' + b.compiler_version +
         ' · ' + b.series + ' · ' + b.config.flag_summary +
-        ' (' + flagStr + ') · N=' + b.stats.total;
+        ' (' + flagStr + ') · N=' + b.stats.total + compStr;
 }
 
 function renderDetailsStatusBar() {
@@ -757,7 +777,8 @@ function renderBuildsTable() {
     var statFilt = getDropdownValue('status-filter-dd');
 
     builds = builds.filter(function(b) {
-        if (filt    && b.package.toLowerCase().indexOf(filt) === -1) return false;
+        if (filt && b.package.toLowerCase().indexOf(filt) === -1 &&
+            (!b.component || b.component.toLowerCase().indexOf(filt) === -1)) return false;
         if (statFilt && b.status !== statFilt) return false;
         if (categoryFilter) {
             if (categoryFilter === '__unanalyzed__') {
@@ -829,8 +850,12 @@ function renderBuildsTable() {
                 escapeAttr(b.retries.length + ' attempts: ' + hist) + '">⟳</span>';
         }
 
+        var compTag = b.component
+            ? ' <span class="comp-tag" title="Archive component">' + escapeHtml(b.component) + '</span>'
+            : '';
+
         html += '<tr class="' + rowCls + '">' +
-            '<td><span class="pkg-name">' + escapeHtml(b.package) + '</span>' + retryBadge + '</td>' +
+            '<td><span class="pkg-name">' + escapeHtml(b.package) + '</span>' + retryBadge + compTag + '</td>' +
             '<td><span class="st st-' + stCls + '">' + stLabel + '</span></td>' +
             '<td class="num mono">' + (b.duration_seconds ? fmtDuration(b.duration_seconds) : '-') + '</td>' +
             '<td class="num mono">' + (b.peak_memory_mb ? b.peak_memory_mb + ' MB' : '-') + '</td>' +
