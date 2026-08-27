@@ -587,10 +587,12 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
         }
 
         // Capture chroot-setup failures regardless of compiler type — they
-        // abort the build before the verification phase runs.
+        // abort the build before the verification phase runs.  Verification
+        // failures ("REBUILD-ERROR: FAILED - ...") are a separate family
+        // handled below and must not be captured here.
         if chroot_setup_error.is_none()
             && trimmed.starts_with("REBUILD-ERROR:")
-            && !trimmed.contains("gcc is NOT reporting as clang")
+            && !trimmed.starts_with("REBUILD-ERROR: FAILED -")
         {
             chroot_setup_error = Some(trimmed);
         }
@@ -600,7 +602,10 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
                 if trimmed == "REBUILD: SUCCESS - gcc is now clang" {
                     success = true;
                 }
-                if trimmed.starts_with("REBUILD-ERROR: FAILED - gcc is NOT reporting as clang") {
+                // The whole "FAILED -" family: the legacy gcc-specific marker
+                // and the per-compiler verification failures from the
+                // versioned/triple-prefixed wrapper checks.
+                if trimmed.starts_with("REBUILD-ERROR: FAILED -") {
                     failed = true;
                 }
                 if trimmed.starts_with("REBUILD:   gcc --version:") && trimmed.contains("clang") {
@@ -695,6 +700,24 @@ mod tests {
     fn starting_build_contains_verification_markers() {
         assert!(STARTING_BUILD_SCRIPT.contains("REBUILD: SUCCESS"));
         assert!(STARTING_BUILD_SCRIPT.contains("REBUILD-ERROR: FAILED"));
+    }
+
+    #[test]
+    fn starting_build_wraps_versioned_compilers_dynamically() {
+        // The wrapper list must be glob-driven, not a hardcoded 9..14 range:
+        // resolute's default gcc is 15+, and an unwrapped gcc-15 would let
+        // packages silently compile with real GCC inside a Clang batch.
+        assert!(STARTING_BUILD_SCRIPT.contains("gcc-[0-9]*"));
+        assert!(STARTING_BUILD_SCRIPT.contains("g++-[0-9]*"));
+        assert!(STARTING_BUILD_SCRIPT.contains("-gcc-[0-9]*"));
+        assert!(!STARTING_BUILD_SCRIPT.contains("for v in 9 10 11 12 13 14"));
+    }
+
+    #[test]
+    fn starting_build_verifies_every_replaced_compiler() {
+        // Verification must iterate over the replaced set, not just gcc.
+        assert!(STARTING_BUILD_SCRIPT.contains("\"${REPLACED[@]}\""));
+        assert!(STARTING_BUILD_SCRIPT.contains("compiler verification failed"));
     }
 
     #[test]
@@ -801,6 +824,21 @@ mod tests {
         let log = "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n";
         let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(result.contains("wrapper setup FAILED"), "got: {result}");
+    }
+
+    #[test]
+    fn generic_verification_failure_marker_detected() {
+        // Newer starting_build.sh emits a generic verification-failure
+        // marker listing the offending compilers (versioned/triple-prefixed
+        // wrappers that still resolve to GCC).
+        let log = concat!(
+            "REBUILD-ERROR: FAILED - gcc-15 is NOT reporting as clang!\n",
+            "REBUILD-ERROR: FAILED - compiler verification failed: gcc-15\n",
+            "REBUILD-ERROR: Build would use GCC, not Clang. Aborting.\n",
+        );
+        let result = detect_compiler_from_log(log, CompilerType::Clang);
+        assert!(result.contains("wrapper setup FAILED"), "got: {result}");
+        assert!(!result.contains("chroot setup failed"), "got: {result}");
     }
 
     // -- ChrootMode ---------------------------------------------------------

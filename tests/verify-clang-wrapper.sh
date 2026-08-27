@@ -218,6 +218,22 @@ assert_in_log \
     "wrapper setup script ran to completion" \
     "REBUILD: Clang $CLANG_VERSION substitution complete"
 
+# 9. No verification-failure marker fired.
+assert_not_in_log \
+    "no compiler verification failures" \
+    "REBUILD-ERROR: FAILED -"
+
+# 10. Every replaced compiler reports as clang.  The verification block
+#     prints one "REBUILD:   <name> --version:" line per wrapped compiler
+#     (gcc, g++, cc, c++, versioned and triple-prefixed variants); each
+#     must contain "clang".  Pre-setup output uses a distinct
+#     "(pre-setup)" label so it is excluded by the anchored pattern.
+if grep -E '^REBUILD:   [^ ]+ --version:' "$LOG_FILE" | grep -qv clang; then
+    fail "all wrapped compilers report as clang (some --version line lacks clang)"
+else
+    pass "all wrapped compilers report as clang"
+fi
+
 # ---------------------------------------------------------------------------
 # Result
 # ---------------------------------------------------------------------------

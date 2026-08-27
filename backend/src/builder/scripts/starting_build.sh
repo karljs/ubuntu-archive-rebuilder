@@ -23,7 +23,7 @@ echo "REBUILD: Pre-setup state:"
 echo "REBUILD:   /usr/bin/gcc -> $(readlink -f /usr/bin/gcc 2>/dev/null || echo 'NOT FOUND')"
 echo "REBUILD:   /usr/bin/g++ -> $(readlink -f /usr/bin/g++ 2>/dev/null || echo 'NOT FOUND')"
 echo "REBUILD:   /usr/bin/cc  -> $(readlink -f /usr/bin/cc 2>/dev/null || echo 'NOT FOUND')"
-echo "REBUILD:   gcc --version: $(gcc --version 2>/dev/null | head -1 || echo 'NOT FOUND')"
+echo "REBUILD:   gcc --version (pre-setup): $(gcc --version 2>/dev/null | head -1 || echo 'NOT FOUND')"
 
 mkdir -p "$WRAPPER_DIR"
 
@@ -38,24 +38,38 @@ create_wrapper() {
     echo "REBUILD:   Created wrapper: $name -> $target"
 }
 
-create_wrapper gcc  "/usr/bin/$CLANG_BIN"
-create_wrapper g++  "/usr/bin/$CLANGXX_BIN"
-create_wrapper cc   "/usr/bin/$CLANG_BIN"
-create_wrapper c++  "/usr/bin/$CLANGXX_BIN"
-
-for v in 9 10 11 12 13 14; do
-    [ -e "/usr/bin/gcc-$v" ] && create_wrapper "gcc-$v" "/usr/bin/$CLANG_BIN"
-    [ -e "/usr/bin/g++-$v" ] && create_wrapper "g++-$v" "/usr/bin/$CLANGXX_BIN"
-done
-
+# Collect every gcc/g++ name present in the chroot: the plain names, all
+# versioned variants (gcc-15, g++-12, ...), and the target-triple-prefixed
+# forms (x86_64-linux-gnu-gcc[-15]).  Globs require a digit after the dash
+# so binutils front-ends (gcc-ar, gcc-nm, gcc-ranlib) are not wrapped.  A
+# hardcoded version list would silently leave newer compilers (gcc-15+ on
+# resolute) unwrapped — packages invoking them directly would compile with
+# real GCC inside a Clang batch.
 ARCH=$(dpkg-architecture -qDEB_HOST_GNU_TYPE 2>/dev/null || echo "")
+NAMES=(gcc g++ cc c++)
+for p in /usr/bin/gcc-[0-9]* /usr/bin/g++-[0-9]*; do
+    [ -e "$p" ] || continue
+    NAMES+=("$(basename "$p")")
+done
 if [ -n "$ARCH" ]; then
-    create_wrapper "$ARCH-gcc" "/usr/bin/$CLANG_BIN"
-    create_wrapper "$ARCH-g++" "/usr/bin/$CLANGXX_BIN"
+    NAMES+=("$ARCH-gcc" "$ARCH-g++")
+    for p in /usr/bin/"$ARCH"-gcc-[0-9]* /usr/bin/"$ARCH"-g++-[0-9]*; do
+        [ -e "$p" ] || continue
+        NAMES+=("$(basename "$p")")
+    done
 fi
+
+for name in "${NAMES[@]}"; do
+    case "$name" in
+        *g++*|*c++*) create_wrapper "$name" "/usr/bin/$CLANGXX_BIN" ;;
+        *)           create_wrapper "$name" "/usr/bin/$CLANG_BIN" ;;
+    esac
+done
 
 # Replace a /usr/bin compiler binary with a symlink to our wrapper.
 # Handles both real files (dpkg-divert) and symlinks (rm + ln).
+# Appends to REPLACED so the verification pass only checks what exists.
+REPLACED=()
 replace_compiler() {
     local name="$1"
     if [ ! -e "/usr/bin/$name" ]; then
@@ -70,22 +84,13 @@ replace_compiler() {
         }
     fi
     ln -sf "$WRAPPER_DIR/$name" "/usr/bin/$name"
+    REPLACED+=("$name")
     echo "REBUILD:   Replaced /usr/bin/$name -> $WRAPPER_DIR/$name"
 }
 
-for name in gcc g++ cc c++; do
+for name in "${NAMES[@]}"; do
     replace_compiler "$name"
 done
-
-for v in 9 10 11 12 13 14; do
-    replace_compiler "gcc-$v"
-    replace_compiler "g++-$v"
-done
-
-if [ -n "$ARCH" ]; then
-    replace_compiler "$ARCH-gcc"
-    replace_compiler "$ARCH-g++"
-fi
 
 # --- Verification ---
 echo ""
@@ -99,16 +104,30 @@ echo "REBUILD:   clang-$CLANG_VERSION direct test: $(/usr/bin/$CLANG_BIN --versi
 echo "REBUILD:   ls -la /usr/bin/clang*:"
 ls -la /usr/bin/clang* 2>/dev/null || echo "REBUILD:   no clang binaries found"
 
-GCC_VERSION_OUTPUT=$(gcc --version 2>&1 | head -1)
-echo "REBUILD:   gcc --version: $GCC_VERSION_OUTPUT"
-
-if echo "$GCC_VERSION_OUTPUT" | grep -qi clang; then
-    echo "REBUILD: SUCCESS - gcc is now clang"
-else
-    echo "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!" >&2
-    echo "REBUILD-ERROR: gcc resolves to: $(which gcc) -> $(readlink -f "$(which gcc)")" >&2
-    echo "REBUILD-ERROR: Build will use GCC, not Clang. Aborting." >&2
+# Every compiler we replaced must report as clang.  Packages can invoke
+# versioned or triple-prefixed names directly, so checking plain gcc alone
+# is not enough — an unwrapped binary would produce a silently-mixed
+# GCC/Clang build.
+if [ "${#REPLACED[@]}" -eq 0 ]; then
+    echo "REBUILD-ERROR: FAILED - no gcc-family compiler found to wrap; clang substitution cannot work" >&2
     exit 1
 fi
 
+VERIFY_FAILED=""
+for name in "${REPLACED[@]}"; do
+    out=$("$name" --version 2>&1 | head -1)
+    echo "REBUILD:   $name --version: $out"
+    if ! echo "$out" | grep -qi clang; then
+        VERIFY_FAILED="$VERIFY_FAILED $name"
+        echo "REBUILD-ERROR: FAILED - $name is NOT reporting as clang!" >&2
+    fi
+done
+
+if [ -n "$VERIFY_FAILED" ]; then
+    echo "REBUILD-ERROR: FAILED - compiler verification failed:$VERIFY_FAILED" >&2
+    echo "REBUILD-ERROR: Build would use GCC, not Clang. Aborting." >&2
+    exit 1
+fi
+
+echo "REBUILD: SUCCESS - gcc is now clang"
 echo "=== REBUILD: Clang $CLANG_VERSION substitution complete ==="

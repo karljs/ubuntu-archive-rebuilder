@@ -9,11 +9,12 @@ For each package in a user-defined batch, the builder will:
 1. Fetch the source from the Ubuntu archive via `pull-lp-source`.
 2. Run `sbuild --chroot-mode=unshare` with the profile's compiler and flags.
 3. For `clang` profiles, install the target version inside the build
-   environment and replace `/usr/bin/gcc` (and `g++`, `cpp`) with a
-   wrapper script that execs `clang`. A verification step confirms
-   `gcc --version` reports `clang` before the build starts. This is
-   intentionally brutish, because packages can invoke `gcc` in a number
-   of unexpected ways.
+   environment and replace `/usr/bin/gcc`, `g++`, `cc`, `c++` and all
+   versioned or architecture-prefixed variants (`gcc-15`,
+   `x86_64-linux-gnu-gcc`, ...) with wrapper scripts that exec `clang`.
+   A verification step confirms every wrapped compiler reports `clang`
+   before the build starts. This is intentionally brutish, because
+   packages can invoke `gcc` in a number of unexpected ways.
 4. Scan build logs for known error patterns, recording structured findings.
 5. Store results in a local SQLite database.
 
