@@ -33,7 +33,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
-use crate::builder::BuildCgroup;
+use crate::builder::cgroup::SystemdScopeCgroup;
 use crate::builder::time_parser::parse_time_output;
 use crate::analyzer::infer_status;
 use crate::models::BuildStatus;
@@ -132,38 +132,21 @@ pub struct SbuildResult {
 /// `timeout(1)` command) to avoid process-hierarchy issues that caused
 /// orphaned chroot processes in earlier iterations.
 pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
-    let (mut cmd, _config_file) = build_command(config)?;
+    let build_id = Uuid::new_v4();
+    let (mut cmd, _config_file, scope_name) = build_command(config, build_id)?;
 
     debug!("Spawning: {:?}", cmd);
 
-    // Attempt to create a cgroup for this build. If cgroups v2 or user
-    // delegation is unavailable, log a warning and proceed without a
-    // memory limit (graceful degradation). A memory limit of 0 means "no
-    // limit", so skip cgroup creation entirely in that case.
-    let build_id = Uuid::new_v4();
-    let cgroup = if config.memory_limit_mb > 0 {
-        match BuildCgroup::create(build_id, config.memory_limit_mb) {
-            Ok(cg) => Some(cg),
-            Err(e) => {
-                warn!("Cgroup unavailable, building without memory limit: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
+    // When memory_limit_mb > 0, build_command wraps sbuild in
+    // `systemd-run --scope --property=MemoryMax=<bytes>`.  systemd creates
+    // the cgroup under user@UID.service (which has Delegate=yes), so the
+    // process starts inside the memory-limited cgroup — no manual PID
+    // migration needed.  OOM detection reads memory.events after the build
+    // but before child.wait() returns (the scope still exists in that window
+    // because systemd-run is still alive collecting the exit code).
     let mut child = cmd.spawn().context("Failed to spawn sbuild")?;
     let child_pid = child.id().context("Failed to get child PID")?;
     let pgid = Pid::from_raw(child_pid as i32);
-
-    // Move the sbuild process into the cgroup so it and all its children
-    // (make, compilers, apt) are subject to the memory limit.
-    if let Some(ref cg) = cgroup {
-        if let Err(e) = cg.add_process(child_pid) {
-            warn!("Failed to add process to cgroup: {e}");
-        }
-    }
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;
@@ -237,6 +220,20 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         }
     }
 
+    // Read OOM status BEFORE child.wait().  At this point the pipes have
+    // closed (sbuild exited) but systemd-run is still alive collecting the
+    // exit code, so the scope's cgroup still exists.  After child.wait()
+    // returns, systemd-run exits and systemd cleans up the scope.
+    let scope_cgroup = scope_name.as_deref().and_then(|name| {
+        match SystemdScopeCgroup::from_scope_name(name) {
+            Ok(cg) => Some(cg),
+            Err(e) => {
+                debug!("Could not access scope cgroup for OOM detection: {e}");
+                None
+            }
+        }
+    });
+
     let exit_status = child.wait().await.context("Failed to wait for sbuild")?;
     let log = log_lines.join("\n");
     let metrics = parse_time_output(&time_output);
@@ -252,12 +249,15 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     // Check if the build was OOM-killed by the cgroup. This overrides
     // the inferred status because a cgroup OOM kill is the authoritative
     // cause of failure.
-    let (final_status, final_memory_limit_mb) = if let Some(cg) = cgroup {
-        let oom_killed = cg.was_oom_killed().unwrap_or(false);
+    let (final_status, final_memory_limit_mb) = if let Some(cg) = scope_cgroup {
+        let oom_killed = cg.read_oom_kill().unwrap_or(false);
         let limit = Some(config.memory_limit_mb);
-        let _ = cg.cleanup();
         let status = if oom_killed { BuildStatus::OomKilled } else { status };
         (status, limit)
+    } else if scope_name.is_some() {
+        // We used systemd-run but couldn't read the scope cgroup (race lost).
+        // The memory limit was still enforced; we just can't detect OOM.
+        (status, Some(config.memory_limit_mb))
     } else {
         (status, None)
     };
@@ -291,10 +291,19 @@ fn http_proxy_for_chroot() -> String {
 /// starting-build (gcc-to-clang wrapper) scripts. For gcc profiles,
 /// only injects a lightweight verification script.
 ///
-/// Returns the command together with the temporary sbuild config file.
-/// The caller must keep the file handle alive until the child process exits,
-/// otherwise the file is deleted before sbuild reads it.
-fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempFile)> {
+/// When `memory_limit_mb > 0`, the command is wrapped in
+/// `systemd-run --user --scope --property=MemoryMax=<bytes>` so that
+/// systemd creates a transient scope under the user manager
+/// (`user@UID.service`), which has `Delegate=yes` and thus allows cgroup
+/// memory limiting even when the rebuilder process itself is in a session
+/// scope that doesn't have cgroup delegation.
+///
+/// Returns the command, the temporary sbuild config file, and the optional
+/// systemd scope unit name (for OOM detection after the build).
+fn build_command(
+    config: &SbuildConfig,
+    build_id: Uuid,
+) -> Result<(Command, tempfile::NamedTempFile, Option<String>)> {
     let dsc_dir = config.dsc_path.parent().context("Invalid .dsc path")?;
 
     let sbuild_config_file = generate_sbuild_config(
@@ -304,13 +313,15 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
         config.chroot_mode,
     )?;
 
-    let mut cmd = Command::new("/usr/bin/time");
-    cmd.arg("-v")
-        .arg("sbuild")
-        .arg("--verbose")
-        .arg("--batch")
-        .arg(format!("--dist={}", config.series))
-        .arg(format!("--arch={}", config.arch));
+    // Collect sbuild arguments (everything after `/usr/bin/time -v sbuild`).
+    let mut sbuild_args: Vec<String> = vec![
+        "--verbose".into(),
+        "--batch".into(),
+        format!("--dist={}", config.series),
+        format!("--arch={}", config.arch),
+    ];
+
+    let mut tmpdir: Option<PathBuf> = None;
 
     match config.chroot_mode {
         ChrootMode::Unshare => {
@@ -320,10 +331,9 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
             let scratch_dir = PathBuf::from("/var/tmp/rebuild-builds");
             std::fs::create_dir_all(&scratch_dir)
                 .context("Failed to create /var/tmp/rebuild-builds")?;
-
-            cmd.arg("--chroot-mode=unshare")
-                .arg("--purge=always")
-                .env("TMPDIR", &scratch_dir);
+            sbuild_args.push("--chroot-mode=unshare".into());
+            sbuild_args.push("--purge=always".into());
+            tmpdir = Some(scratch_dir);
         }
         ChrootMode::Schroot => {
             // No --chroot-mode flag: schroot is sbuild's default. Purge
@@ -350,8 +360,8 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
                 &STARTING_BUILD_SCRIPT
                     .replace("__CLANG_VERSION__", &config.compiler_version),
             );
-            cmd.arg(format!("--chroot-setup-commands={setup_cmd}"));
-            cmd.arg(format!("--starting-build-commands={starting_cmd}"));
+            sbuild_args.push(format!("--chroot-setup-commands={setup_cmd}"));
+            sbuild_args.push(format!("--starting-build-commands={starting_cmd}"));
         }
         CompilerType::Gcc => {
             let starting_cmd = wrap_in_heredoc(
@@ -359,17 +369,56 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
                 "GCC_VERIFY_EOF",
                 GCC_VERIFY_SCRIPT,
             );
-            cmd.arg(format!("--starting-build-commands={starting_cmd}"));
+            sbuild_args.push(format!("--starting-build-commands={starting_cmd}"));
         }
     }
 
-    cmd.arg("--no-clean-source")
-        .arg(&config.dsc_path)
-        .current_dir(dsc_dir)
+    sbuild_args.push("--no-clean-source".into());
+    sbuild_args.push(config.dsc_path.to_string_lossy().into_owned());
+
+    // Build the outer command, optionally wrapping in systemd-run for
+    // cgroup memory limiting.
+    let scope_name = if config.memory_limit_mb > 0 {
+        Some(format!("rebuild-{build_id}.scope"))
+    } else {
+        None
+    };
+
+    let mut cmd = if config.memory_limit_mb > 0 {
+        let limit_bytes = config.memory_limit_mb * 1024 * 1024;
+        let unit = scope_name.as_ref().unwrap();
+        let mut cmd = Command::new("systemd-run");
+        cmd.arg("--user")
+            .arg("--scope")
+            .arg("--quiet")
+            .arg(format!("--unit={unit}"))
+            .arg(format!("--property=MemoryMax={limit_bytes}"))
+            .arg("--")
+            .arg("/usr/bin/time")
+            .arg("-v")
+            .arg("sbuild");
+        for a in &sbuild_args {
+            cmd.arg(a);
+        }
+        cmd
+    } else {
+        let mut cmd = Command::new("/usr/bin/time");
+        cmd.arg("-v").arg("sbuild");
+        for a in &sbuild_args {
+            cmd.arg(a);
+        }
+        cmd
+    };
+
+    cmd.current_dir(dsc_dir)
         .env("SBUILD_CONFIG", sbuild_config_file.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some(td) = tmpdir {
+        cmd.env("TMPDIR", td);
+    }
 
     // Spawn in its own process group so we can `killpg` the entire tree.
     // SAFETY: `setpgid` is async-signal-safe (POSIX.1-2017 §2.4.3), which is
@@ -382,7 +431,7 @@ fn build_command(config: &SbuildConfig) -> Result<(Command, tempfile::NamedTempF
         });
     }
 
-    Ok((cmd, sbuild_config_file))
+    Ok((cmd, sbuild_config_file, scope_name))
 }
 
 /// Wrap a shell script body in a heredoc that writes it to a temp file inside
