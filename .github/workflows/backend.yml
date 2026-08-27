@@ -57,4 +57,4 @@ jobs:
       - name: shellcheck
         run: |
           # ubuntu-latest runners ship shellcheck preinstalled.
-          shellcheck -x src/builder/scripts/*.sh ../tests/verify-clang-wrapper.sh ../scripts/run-matrix.sh
+          shellcheck -x src/builder/scripts/*.sh scripts/*.sh ../tests/verify-clang-wrapper.sh

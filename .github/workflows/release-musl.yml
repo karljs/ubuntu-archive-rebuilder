@@ -1,0 +1,46 @@
+name: Release musl artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-musl
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          key: musl
+
+      - name: Install musl tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Strip and verify
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/rebuilder
+          strip "$BIN"
+          file --brief "$BIN" | grep -q static || { echo "not a static binary" >&2; exit 1; }
+          "$BIN" --version
+
+      - name: Update artifact branch
+        run: scripts/push-musl-artifact.sh target/x86_64-unknown-linux-musl/release/rebuilder

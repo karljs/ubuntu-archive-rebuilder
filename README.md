@@ -72,6 +72,22 @@ Each `[[flags]]` entry includes a `reason` field to track why the
 workaround exists. Profiles are snapshotted into the database at build
 time.
 
+## Static build for remote machines
+
+The "Release musl artifact" workflow (Actions tab, or
+`gh workflow run release-musl.yml --ref main`) builds a static musl
+`rebuilder` on GitHub's runners and publishes it to the
+`artifacts/rebuilder-x86_64-musl` branch (always `main` plus one binary
+commit, force-updated per run).
+
+Fetch it on the target machine with a single allowed URL (github.com):
+
+```bash
+git fetch origin artifacts/rebuilder-x86_64-musl
+git show origin/artifacts/rebuilder-x86_64-musl:backend/target/x86_64-unknown-linux-musl/release/rebuilder > rebuilder
+chmod +x rebuilder
+```
+
 ## Package list format
 
 One source package name per line; blank lines and `#` comments are
