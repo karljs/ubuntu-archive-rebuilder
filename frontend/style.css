@@ -13,6 +13,7 @@
     --green:        #1a7f37;
     --red:          #cf222e;
     --yellow:       #9a6700;
+    --orange:       #bc4c00;
     --blue:         #0969da;
     --purple:       #8250df;
     --mono: 'SF Mono', Monaco, Consolas, 'Liberation Mono', monospace;
@@ -222,6 +223,9 @@ body {
 .s-env     { color: var(--purple); font-weight: 600; }
 .s-timeout { color: var(--yellow); font-weight: 600; }
 .s-depwait { color: var(--blue);  font-weight: 600; }
+.s-oom_killed { color: var(--orange); font-weight: 600; }
+.s-retry   { color: var(--orange); font-weight: 600; }
+.s-st      { font-weight: 600; }
 
 .rate-bar  { display: inline-block; width: 80px; height: 6px; background: var(--red); border-radius: 1px; overflow: hidden; vertical-align: middle; }
 .rate-fill { display: block; height: 100%; background: var(--green); }
@@ -353,6 +357,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 .st-succeeded { color: var(--green); } .st-succeeded::before { background: var(--green); }
 .st-failed    { color: var(--red);   } .st-failed::before    { background: var(--red);   }
 .st-environmental { color: var(--purple); } .st-environmental::before { background: var(--purple); }
+.st-oom_killed { color: var(--orange); } .st-oom_killed::before { background: var(--orange); }
 .st-timeout   { color: var(--yellow); } .st-timeout::before  { background: var(--yellow); }
 .st-dep_wait  { color: var(--blue);  } .st-dep_wait::before  { background: var(--blue);  }
 .st-pending, .st-building { color: var(--text-3); }
