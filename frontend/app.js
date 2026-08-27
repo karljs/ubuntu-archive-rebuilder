@@ -3,50 +3,42 @@
 const DATA_BASE_URL = './data';
 const SQL_JS_CDN = 'https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/';
 
-// ── Global state ──
 let sqlDb = null;
-let batches = [];          // all batches, enriched with .stats and .config
 let sortColumn = 'package';
 let sortDirection = 'asc';
-let currentBatch = null;   // batch object currently shown in Details
-let currentBatchData = null; // { builds, finding_summary }
-let categoryFilter = null;  // active Issue-Category filter on the Details builds table
+let currentBatch = null;
+let currentBatchData = null;
+let categoryFilter = null;
 
-// profile_configs lookup: profile_name -> { flag_summary, flags_json, has_flags }
 var profileConfigMap = {};
 
-// Compare tab state: ordered list of selected batch IDs
 var compareSelectedIds = [];
 
-// Series release order, from export_meta.series_order (written by the
-// backend from distro-info). Empty on legacy exports: first-seen fallback.
+// Release order from export_meta.series_order (distro-info); first-seen
+// fallback on exports that lack the table.
 var seriesOrder = [];
 
-// True when batches span more than one arch; arch then appears in labels.
 var multiArch = false;
 
-// ════════════════════════════════════════════════
-// Bootstrap
-// ════════════════════════════════════════════════
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-} else {
-    init();
+if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
 }
 
 async function init() {
     try {
         var SQL = await initSqlJs({ locateFile: function(f) { return SQL_JS_CDN + f; } });
         var buf = await fetch(DATA_BASE_URL + '/rebuild.db?v=' + Date.now()).then(function(r) {
-            if (!r.ok) throw new Error('rebuild.db not found — run: rebuilder export');
+            if (!r.ok) throw new Error('rebuild.db not found; run: rebuilder export');
             return r.arrayBuffer();
         });
         sqlDb = new SQL.Database(new Uint8Array(buf));
         el('loading-overlay').classList.add('hidden');
         loadData();
         setupEventListeners();
-        // Record the initial overview state so the back button can return here.
         history.replaceState({ tab: 'overview' }, '');
         renderOverview();
     } catch(err) {
@@ -55,11 +47,7 @@ async function init() {
     }
 }
 
-// ════════════════════════════════════════════════
-// Data loading
-// ════════════════════════════════════════════════
-
-// Export schema capabilities; old exports lack columns/tables added later.
+// Old exports lack columns/tables added later; probed before use.
 var exportHas = { attemptNumber: false, component: false, arch: false, exportMeta: false };
 var STATUS_ORDER = ['succeeded', 'failed', 'oom_killed', 'timeout', 'dep_wait', 'environmental'];
 
@@ -89,8 +77,7 @@ function probeExportSchema() {
     }
 }
 
-// Matches the backend's get_batch_stats: one row per package, final attempt
-// only. OOM retries write multiple rows per package.
+// One row per package, final attempt only (matches backend get_batch_stats).
 var FINAL_ATTEMPT_WHERE = "b.attempt_number = (" +
     "SELECT MAX(b2.attempt_number) FROM builds b2 " +
     "WHERE b2.batch_id = b.batch_id AND b2.source_package = b.source_package)";
@@ -124,9 +111,8 @@ function loadData() {
         s.by_status[r.status] = n;
     });
 
-    // Environmental-only failures: failed builds whose findings are ALL
-    // environmental (infra artifacts). Split out of `failed` and excluded
-    // from success-rate denominators, matching the backend.
+    // Environmental-only failures are split out of `failed` (see
+    // comparableTotal), matching the backend.
     try {
         var envWhere = "b.status = 'failed' AND " +
             "EXISTS (SELECT 1 FROM build_findings f WHERE f.build_id = b.id) AND " +
@@ -145,7 +131,6 @@ function loadData() {
         console.warn('finding_class not present; re-run: rebuilder export');
     }
 
-    // Packages with >1 attempt (any batch).
     if (exportHas.attemptNumber) {
         try {
             dbQuery(
@@ -182,7 +167,6 @@ function loadData() {
     });
 
     if (seriesOrder.length === 0) {
-        // First-seen order (earliest batch started_at per series), oldest left.
         var firstSeen = {};
         batches.forEach(function(b) {
             if (!firstSeen[b.series] || b.started_at < firstSeen[b.series]) firstSeen[b.series] = b.started_at;
@@ -202,7 +186,6 @@ function loadData() {
 }
 
 function loadBatchData(batchId) {
-    // Legacy exports lack attempt_number/jobs/component; probe before selecting.
     var cols = "b.id, b.source_package AS package, b.version, b.status, " +
         "b.build_duration_seconds AS duration_seconds, b.peak_memory_mb";
     if (exportHas.attemptNumber) cols += ", b.attempt_number, b.jobs";
@@ -213,7 +196,6 @@ function loadBatchData(batchId) {
         [batchId]
     );
 
-    // Full attempt history for retried packages (all attempts, in order).
     var attemptRows = [];
     if (exportHas.attemptNumber) {
         attemptRows = dbQuery(
@@ -282,10 +264,6 @@ function loadBatchData(batchId) {
     };
 }
 
-// ════════════════════════════════════════════════
-// Tab navigation
-// ════════════════════════════════════════════════
-
 function switchTab(tabName, pushHistory) {
     document.querySelectorAll('.tab-btn').forEach(function(btn) {
         btn.classList.toggle('active', btn.dataset.tab === tabName);
@@ -293,8 +271,7 @@ function switchTab(tabName, pushHistory) {
     document.querySelectorAll('.tab-panel').forEach(function(p) {
         p.classList.toggle('active', p.id === 'tab-' + tabName);
     });
-    // Callers that want to manage their own history entry pass pushHistory=false.
-    // Plain tab-button clicks pass nothing and get a history entry here.
+    // pushHistory=false lets callers batch their own history entry.
     if (pushHistory !== false) {
         pushView({ tab: tabName, batchId: currentBatch ? currentBatch.id : null });
     }
@@ -305,26 +282,20 @@ function getActiveTab() {
     return btn ? btn.dataset.tab : 'overview';
 }
 
-// Navigate to Details for a specific batch (called from Overview row click,
-// profile comparison, version table, etc.)  One history entry total.
+// One history entry for the whole navigation.
 function navigateToDetails(batchId) {
-    loadDetailsForBatch(batchId, false);  // don't push yet
-    switchTab('details', false);          // don't push yet
-    pushView({ tab: 'details', batchId: batchId });  // push once
+    loadDetailsForBatch(batchId, false);
+    switchTab('details', false);
+    pushView({ tab: 'details', batchId: batchId });
 }
 
-// Navigate to Compare pre-populated with an array of batch IDs.
 function navigateToCompare(batchIds) {
     compareSelectedIds = batchIds.slice();
-    switchTab('compare', false);          // don't push yet
-    pushView({ tab: 'compare', compareIds: batchIds });  // push once
+    switchTab('compare', false);
+    pushView({ tab: 'compare', compareIds: batchIds });
     renderCompareBatchList();
     renderCompareTable();
 }
-
-// ════════════════════════════════════════════════
-// Overview tab — success rate matrix
-// ════════════════════════════════════════════════
 
 function renderOverview() {
     var container = el('overview-matrix');
@@ -335,8 +306,6 @@ function renderOverview() {
         return;
     }
 
-    // Row keys: compiler_type alphabetically, then natural version order
-    // ("9" < "10" < "2.28"). No compiler list is hardcoded.
     var rowSet = {};
     batches.forEach(function(b) { rowSet[b.compiler_type + ' ' + b.compiler_version] = true; });
     var rows = Object.keys(rowSet).sort(function(a, b) {
@@ -345,8 +314,6 @@ function renderOverview() {
         return td !== 0 ? td : compareVersions(aP[1], bP[1]);
     });
 
-    // Columns: one per series, or per (series, arch) when the data spans
-    // multiple arches. Ordered by series release order from export_meta.
     var colMap = {};
     batches.forEach(function(b) {
         var ck = b.series + (multiArch ? '\x01' + (b.arch || '') : '');
@@ -359,7 +326,6 @@ function renderOverview() {
         return d !== 0 ? d : x.localeCompare(y);
     });
 
-    // Group batches by (compilerKey, column, profile_name); largest-N per profile.
     var cellProfiles = {};
     batches.forEach(function(b) {
         var colKey = b.series + (multiArch ? '\x01' + (b.arch || '') : '');
@@ -391,7 +357,6 @@ function renderOverview() {
                 return;
             }
 
-            // Sort profiles: baseline first, then by flag_summary.
             var profiles = Object.values(profileMap).sort(function(a, b) {
                 var ca = a.config, cb = b.config;
                 if (ca.has_flags !== cb.has_flags) return ca.has_flags - cb.has_flags;
@@ -405,7 +370,7 @@ function renderOverview() {
                 var colorCls = rateColorClass(rate);
                 var flags = parseFlagsJson(b.config.flags_json);
                 var flagDetail = flags.length === 0 ? 'No extra flags'
-                    : flags.map(function(f) { return f.flag + ' — ' + f.reason; }).join('\n');
+                    : flags.map(function(f) { return f.flag + ': ' + f.reason; }).join('\n');
                 var envNote = s.environmental > 0 ? '\n' + s.environmental + ' environmental (excluded)' : '';
                 var title = b.profile_name + '\n' + statusCount(s, 'succeeded') + '/' + comparableTotal(s) + ' succeeded' + envNote + '\n' + flagDetail;
 
@@ -427,10 +392,6 @@ function renderOverview() {
 
     container.innerHTML = html;
 }
-
-// ════════════════════════════════════════════════
-// Details tab
-// ════════════════════════════════════════════════
 
 function populateDetailsBatchSelector() {
     var opts = batches.map(function(b) {
@@ -462,9 +423,8 @@ function loadDetailsForBatch(batchId, pushHistory, preserveFilter) {
     currentBatch = batches.find(function(b) { return b.id === batchId; });
     if (!currentBatch) return;
     currentBatchData = loadBatchData(batchId);
-    if (!preserveFilter) categoryFilter = null;  // reset category filter when switching batches
+    if (!preserveFilter) categoryFilter = null;
 
-    // Update selector to reflect current batch.
     setDropdownValue('details-batch-dd', batchId);
 
     renderDetailsContext();
@@ -474,8 +434,6 @@ function loadDetailsForBatch(batchId, pushHistory, preserveFilter) {
     renderProfileComparison();
     renderVersionContext();
 
-    // Only push when called directly (e.g. batch dropdown change).
-    // navigateToDetails() manages its own single push and passes false.
     if (pushHistory === true) pushView({ tab: 'details', batchId: batchId });
 }
 
@@ -529,7 +487,7 @@ function renderDetailsStatusBar() {
         var label = st === 'dep_wait' ? 'dep-wait' : st.replace('_', ' ');
         segments.push('<span class="s-st s-' + st + '">' + n + ' ' + escapeHtml(label) + '</span>');
     });
-    // Any status the fixed order doesn't know about still shows.
+    // Statuses outside STATUS_ORDER still show.
     Object.keys(s.by_status).forEach(function(st) {
         if (STATUS_ORDER.indexOf(st) === -1 && s.by_status[st]) {
             segments.push('<span class="s-st">' + s.by_status[st] + ' ' + escapeHtml(st) + '</span>');
@@ -567,12 +525,11 @@ function renderDetailsFindings() {
         return;
     }
 
-    // A clickable category bar that filters the builds table. `extraCls` adds a
-    // severity/class colour; `filterValue` is what renderBuildsTable matches on.
+    // Clicking a bar filters the builds table on filterValue.
     function bar(label, count, filterValue, extraCls, titleText) {
         var active = categoryFilter === filterValue;
         var pkgWord = count === 1 ? 'package' : 'packages';
-        var defaultTitle = count + ' ' + pkgWord + ' affected — click to filter by ' + label;
+        var defaultTitle = count + ' ' + pkgWord + ' affected; click to filter by ' + label;
         return '<div class="findings-bar-item findings-bar-clickable' + (extraCls ? ' ' + extraCls : '') +
             (active ? ' findings-bar-active' : '') + '" ' +
             'data-action="filter-category" data-cat="' + escapeAttr(filterValue) + '" ' +
@@ -585,7 +542,6 @@ function renderDetailsFindings() {
 
     var html = '';
 
-    // Error findings (from failed builds) — split toolchain vs environmental.
     if (errors.length > 0 || unanalyzed > 0) {
         var toolchainErrors = errors.filter(function(f) { return f.finding_class !== 'environmental'; });
         var envErrors = errors.filter(function(f) { return f.finding_class === 'environmental'; });
@@ -597,7 +553,7 @@ function renderDetailsFindings() {
         if (unanalyzed > 0) {
             var uWord = unanalyzed === 1 ? 'package' : 'packages';
             html += bar('Unanalyzed (no patterns matched)', unanalyzed, '__unanalyzed__',
-                'findings-bar-unanalyzed', unanalyzed + ' ' + uWord + ' failed with no matched pattern — click to filter');
+                'findings-bar-unanalyzed', unanalyzed + ' ' + uWord + ' failed with no matched pattern; click to filter');
         }
 
         if (envErrors.length > 0) {
@@ -609,7 +565,6 @@ function renderDetailsFindings() {
         }
     }
 
-    // Observation findings (from succeeded builds)
     if (observations.length > 0) {
         html += '<p class="findings-section-label findings-label-observation" style="margin-top:6px">Observations</p>';
         observations.forEach(function(f) {
@@ -620,8 +575,6 @@ function renderDetailsFindings() {
     fc.innerHTML = html;
 }
 
-// ── Panel 2: Profile comparison ──
-
 function renderProfileComparison() {
     var panel  = el('details-panel-profiles');
     var ctxEl  = el('details-profile-context');
@@ -629,7 +582,6 @@ function renderProfileComparison() {
     if (!panel || !currentBatch) return;
 
     var b = currentBatch;
-    // Sibling profiles: same compiler, series, and arch.
     var siblings = batches.filter(function(s) {
         return s.compiler_type    === b.compiler_type &&
                s.compiler_version === b.compiler_version &&
@@ -637,7 +589,6 @@ function renderProfileComparison() {
                s.arch             === b.arch;
     });
 
-    // Group by profile_name, pick largest-N per profile.
     var profileMap = {};
     siblings.forEach(function(s) {
         var prev = profileMap[s.profile_name];
@@ -651,7 +602,6 @@ function renderProfileComparison() {
         return a.config.flag_summary.localeCompare(b.config.flag_summary);
     });
 
-    // Hide panel if only one profile (nothing to compare).
     if (profiles.length < 2) {
         panel.classList.add('hidden');
         return;
@@ -659,14 +609,13 @@ function renderProfileComparison() {
     panel.classList.remove('hidden');
     if (ctxEl) ctxEl.textContent = b.compiler_type + ' ' + b.compiler_version + ' · ' + b.series;
 
-    // Build profile summary table.
     var html = '<table><thead><tr>' +
         '<th>Profile config</th><th>Flags</th><th class="num">N</th>' +
         '<th class="num">Succeeded</th><th class="num">Failed</th><th class="num">Rate</th>' +
         '</tr></thead><tbody>';
     profiles.forEach(function(p) {
         var s = p.stats;
-        var rate = comparableTotal(s) > 0 ? successRate(s).toFixed(1) : '—';
+        var rate = comparableTotal(s) > 0 ? successRate(s).toFixed(1) : '-';
         var flags = parseFlagsJson(p.config.flags_json);
         var flagCells = flags.length === 0 ? '<span class="muted">none</span>'
             : unique(flags.map(function(f) { return f.flag; })).map(function(f) {
@@ -689,14 +638,11 @@ function renderProfileComparison() {
             '</tr>';
     });
     html += '</tbody></table>';
-    // Add Compare button for all profiles in this cell.
     var ids = profiles.map(function(p) { return p.id; });
     html += '<p style="margin-top:6px"><button class="btn btn-sm" data-action="go-compare" data-ids="' +
         escapeAttr(JSON.stringify(ids)) + '">Open in Compare \u2192</button></p>';
     if (tblEl) tblEl.innerHTML = html;
 }
-
-// ── Panel 3: Version context ──
 
 function renderVersionContext() {
     var panel  = el('details-panel-versions');
@@ -707,7 +653,6 @@ function renderVersionContext() {
     var b = currentBatch;
     var summary = b.config.flag_summary;
 
-    // Same series, arch, flag config, and compiler type; grouped by version.
     var related = batches.filter(function(s) {
         return s.series === b.series &&
                s.arch === b.arch &&
@@ -732,9 +677,8 @@ function renderVersionContext() {
         return;
     }
     panel.classList.remove('hidden');
-    // Subtitle explains exactly what is held constant so the user knows what they are comparing.
     if (ctxEl) ctxEl.textContent =
-        b.compiler_type + ' on ' + b.series + ', ' + summary + ' — success rate by version';
+        b.compiler_type + ' on ' + b.series + ', ' + summary + ': success rate by version';
 
     var html = '<table><thead><tr>' +
         '<th>' + escapeHtml(b.compiler_type) + ' version</th>' +
@@ -761,10 +705,6 @@ function renderVersionContext() {
     html += '</tbody></table>';
     if (tblEl) tblEl.innerHTML = html;
 }
-
-// ════════════════════════════════════════════════
-// Builds table (Details Panel 1)
-// ════════════════════════════════════════════════
 
 function renderBuildsTable() {
     if (!currentBatchData) return;
@@ -809,7 +749,6 @@ function renderBuildsTable() {
         if (th.dataset.sort === sortColumn) th.classList.add(sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
     });
 
-    // Result count / active filter line.
     var rcEl = el('builds-result-count');
     if (rcEl) {
         var parts = [builds.length + ' of ' + currentBatchData.builds.length + ' packages'];
@@ -829,13 +768,11 @@ function renderBuildsTable() {
             : (b.status === 'failed' || b.status === 'timeout' || b.status === 'dep_wait')
               ? '<span class="cell-hint" data-hint="Build did not complete">n/a</span>' : '-';
 
-        // Row highlight: environmental-only failures get a distinct class.
         var rowCls = '';
         if (b.status !== 'succeeded') {
             rowCls = b.env_only ? 'build-row-env' : 'build-row-fail';
         }
 
-        // Status cell: environmental-only failures display as "environmental".
         var isEnv = b.status !== 'succeeded' && b.env_only;
         var stLabel = isEnv ? 'environmental' : (b.status === 'oom_killed' ? 'oom-killed' : b.status.replace('_', ' '));
         var stCls = isEnv ? 'environmental' : b.status;
@@ -871,9 +808,7 @@ function renderBuildsTable() {
     tbody.innerHTML = html;
 }
 
-// Set (or toggle off) the Issue-Category filter and re-render.
-// Activating a filter pushes a history entry so the back button can clear it;
-// clearing a filter replaces the current entry (no extra back step needed).
+// Activating pushes a history entry; clearing replaces it (no extra back step).
 function setCategoryFilter(cat) {
     var next = (categoryFilter === cat) ? null : cat;
     var batchId = currentBatch ? currentBatch.id : null;
@@ -901,10 +836,6 @@ function handleSort(col) {
     sortColumn = col;
     renderBuildsTable();
 }
-
-// ════════════════════════════════════════════════
-// Compare tab — N-way batch comparison
-// ════════════════════════════════════════════════
 
 function renderCompareBatchList() {
     var list = el('compare-batch-list');
@@ -950,7 +881,6 @@ function renderCompareTable() {
         return;
     }
 
-    // Load build data for each selected batch.
     var selectedBatches = compareSelectedIds.map(function(id) {
         return batches.find(function(b) { return b.id === id; });
     }).filter(Boolean);
@@ -962,8 +892,6 @@ function renderCompareTable() {
             "FROM builds b WHERE b.batch_id = ?" + finalWhere,
             [b.id]
         );
-        // Top category per failing build, plus whether the build's findings are
-        // all environmental (infra artifact, not a toolchain failure).
         var cats = {};
         var envOnly = {};
         dbQuery(
@@ -974,8 +902,6 @@ function renderCompareTable() {
         ).forEach(function(r) {
             if (!cats[r.source_package] || r.cnt > cats[r.source_package].cnt)
                 cats[r.source_package] = { category: r.category, cnt: Number(r.cnt) };
-            // Track environmental-only: starts true on first finding, flipped
-            // false if any non-environmental finding appears.
             if (envOnly[r.source_package] === undefined) envOnly[r.source_package] = true;
             if (r.finding_class !== 'environmental') envOnly[r.source_package] = false;
         });
@@ -984,12 +910,10 @@ function renderCompareTable() {
         return { batch: b, map: map, cats: cats, envOnly: envOnly };
     });
 
-    // Union of all packages across selected batches.
     var pkgSet = {};
     batchData.forEach(function(d) { Object.keys(d.map).forEach(function(p) { pkgSet[p] = true; }); });
     var allPkgs = Object.keys(pkgSet).sort();
 
-    // Classify each package: has any failure across any batch?
     var mixed = [], allFail = [], allSucc = [];
     allPkgs.forEach(function(pkg) {
         var statuses = batchData.map(function(d) { return d.map[pkg] ? d.map[pkg].status : null; });
@@ -1001,7 +925,6 @@ function renderCompareTable() {
         else allSucc.push(pkg);
     });
 
-    // Column headers.
     var colW = Math.max(80, Math.floor(600 / selectedBatches.length));
     var headerHtml = '<th>Package</th>';
     selectedBatches.forEach(function(b) {
@@ -1013,7 +936,7 @@ function renderCompareTable() {
     function pkgRow(pkg) {
         var cells = batchData.map(function(d) {
             var bld = d.map[pkg];
-            if (!bld) return '<td class="compare-cell compare-cell-missing"><span class="muted">—</span></td>';
+            if (!bld) return '<td class="compare-cell compare-cell-missing"><span class="muted">-</span></td>';
             var st = bld.status;
             var isEnv = st !== 'succeeded' && d.envOnly[pkg];
             var cat = (st !== 'succeeded' && d.cats[pkg]) ? d.cats[pkg].category : null;
@@ -1027,7 +950,6 @@ function renderCompareTable() {
                 '</td>';
         });
 
-        // Log link: first batch where this package failed.
         var logCell = '<td>';
         for (var i = 0; i < batchData.length; i++) {
             var bld = batchData[i].map[pkg];
@@ -1043,19 +965,16 @@ function renderCompareTable() {
 
     var html = '<table class="compare-table"><thead><tr>' + headerHtml + '</tr></thead><tbody>';
 
-    // Mixed outcome / partially failing packages first.
     mixed.forEach(function(pkg) { html += pkgRow(pkg); });
 
-    // All-failing packages.
     if (allFail.length > 0) {
         html += '<tr class="compare-section-row"><td colspan="' + (selectedBatches.length + 2) + '">Failing in all selected batches (' + allFail.length + ')</td></tr>';
         allFail.forEach(function(pkg) { html += pkgRow(pkg); });
     }
 
-    // All-succeeded — collapsed.
     if (allSucc.length > 0) {
         html += '<tr class="compare-section-row compare-section-collapsed" data-toggle="compare-succ">' +
-            '<td colspan="' + (selectedBatches.length + 2) + '">' + allSucc.length + ' succeeded in all — click to expand</td></tr>';
+            '<td colspan="' + (selectedBatches.length + 2) + '">' + allSucc.length + ' succeeded in all; click to expand</td></tr>';
         html += '<tbody id="compare-succ-rows" class="hidden">';
         allSucc.forEach(function(pkg) { html += pkgRow(pkg); });
         html += '</tbody>';
@@ -1063,12 +982,10 @@ function renderCompareTable() {
 
     html += '</tbody></table>';
 
-    // Resource comparison — available for any number of batches.
     html += renderResourceComparison(batchData, selectedBatches);
 
     content.innerHTML = html;
 
-    // Wire expand toggle.
     var tog = content.querySelector('[data-toggle="compare-succ"]');
     if (tog) {
         tog.addEventListener('click', function() {
@@ -1085,12 +1002,10 @@ function renderResourceComparison(batchData, selectedBatches) {
     var n = selectedBatches.length;
     var pairwise = n === 2;
 
-    // Build column headers — short label per batch.
     var colHeaders = selectedBatches.map(function(b) {
         return escapeHtml(batchLabel(b));
     });
 
-    // Collect all packages that have resource data in at least one batch.
     var pkgSet = {};
     batchData.forEach(function(d) {
         Object.keys(d.map).forEach(function(pkg) {
@@ -1103,8 +1018,6 @@ function renderResourceComparison(batchData, selectedBatches) {
 
     var html = '';
 
-    // Build Time table.
-    // Sort by: largest spread between max and min duration across batches.
     var durRows = allPkgs.map(function(pkg) {
         var vals = batchData.map(function(d) {
             var bld = d.map[pkg];
@@ -1137,7 +1050,6 @@ function renderResourceComparison(batchData, selectedBatches) {
         html += '</tbody></table></div>';
     }
 
-    // Peak Memory table.
     var memRows = allPkgs.map(function(pkg) {
         var vals = batchData.map(function(d) {
             var bld = d.map[pkg];
@@ -1172,10 +1084,6 @@ function renderResourceComparison(batchData, selectedBatches) {
 
     return html;
 }
-
-// ════════════════════════════════════════════════
-// Event listeners
-// ════════════════════════════════════════════════
 
 function setupEventListeners() {
     document.querySelectorAll('.tab-btn').forEach(function(btn) {
@@ -1216,8 +1124,7 @@ function setupEventListeners() {
     });
 }
 
-// Delegated handler for log/details buttons anywhere in the document.
-document.addEventListener('click', function(e) {
+if (typeof document !== 'undefined') document.addEventListener('click', function(e) {
     if (e.target.closest('.dropdown')) return;
     var btn = e.target.closest('[data-action]');
     if (!btn) return;
@@ -1235,10 +1142,6 @@ document.addEventListener('click', function(e) {
     }
 });
 
-// ════════════════════════════════════════════════
-// Modals
-// ════════════════════════════════════════════════
-
 function closeModal()    { var m = el('modal');     if (m) m.classList.add('hidden'); document.body.style.overflow = ''; }
 function closeLogModal() { var m = el('log-modal'); if (m) m.classList.add('hidden'); document.body.style.overflow = ''; }
 
@@ -1254,7 +1157,7 @@ function showBuildDetails(buildId) {
         if (bld) pkg = bld.package;
     }
     var mt = el('modal-title'), mb = el('modal-body');
-    if (mt) mt.textContent = pkg + ' — Findings';
+    if (mt) mt.textContent = pkg + ' · Findings';
     if (findings.length === 0) {
         if (mb) mb.innerHTML = '<p class="muted">No findings.</p>';
     } else {
@@ -1300,8 +1203,7 @@ async function showBuildLog(buildId, packageName) {
     var lsc = el('log-search-count');
     var lc = el('log-content');
 
-    // Show the modal immediately so the user gets feedback.
-    if (lt) lt.textContent = packageName + ' — Build Log';
+    if (lt) lt.textContent = packageName + ' · Build Log';
     if (ls) ls.value = '';
     if (lsc) lsc.textContent = '';
     if (lc) lc.innerHTML = '<div class="log-loading">Loading\u2026</div>';
@@ -1379,21 +1281,15 @@ function handleLogSearch() {
     }, 150);
 }
 
-// ════════════════════════════════════════════════
-// Browser history
-// ════════════════════════════════════════════════
-
-var _historyInitialised = true; // replaceState is called at init; all subsequent calls are pushState
 function pushView(state) {
     history.pushState(state, '');
 }
-window.addEventListener('popstate', function(e) {
+if (typeof window !== 'undefined') window.addEventListener('popstate', function(e) {
     if (!e.state) return;
     var tab = e.state.tab || 'overview';
     switchTab(tab, false);
     if (tab === 'details' && e.state.batchId) {
-        // Restore the category filter from history state before loading the batch,
-        // so loadDetailsForBatch does not clobber it.
+        // Restore before loadDetailsForBatch resets it.
         categoryFilter = e.state.categoryFilter || null;
         loadDetailsForBatch(e.state.batchId, false, true);
     }
@@ -1403,10 +1299,6 @@ window.addEventListener('popstate', function(e) {
         renderCompareTable();
     }
 });
-
-// ════════════════════════════════════════════════
-// Utilities
-// ════════════════════════════════════════════════
 
 function el(id) { return document.getElementById(id); }
 
@@ -1421,8 +1313,7 @@ function dbQuery(sql, params) {
 
 function unique(arr) { return arr.filter(function(v, i, a) { return a.indexOf(v) === i; }); }
 
-// Natural version order: numeric runs compare numerically ("9" < "10",
-// "2.9" < "2.28"), everything else lexically.
+// Natural version order: "9" < "10" < "2.28".
 function compareVersions(a, b) {
     var ai = String(a).split(/(\d+)/), bi = String(b).split(/(\d+)/);
     for (var i = 1; i < Math.max(ai.length, bi.length); i += 2) {
@@ -1436,8 +1327,6 @@ function compareVersions(a, b) {
     return 0;
 }
 
-// Label for a batch in selectors and table headers: profile, series, arch
-// (arch only when the data spans multiple).
 function batchLabel(b) {
     return b.profile_name + ' · ' + b.series + (multiArch && b.arch ? ' · ' + b.arch : '');
 }
@@ -1463,8 +1352,8 @@ function rateColorClass(rate) {
     return 'rate-red';
 }
 
-// Denominator for a fair compiler comparison: total builds minus environmental-
-// only failures (infra artifacts that aren't a toolchain result).
+// Environmental-only failures (infra artifacts) are excluded from the
+// comparison denominator.
 function comparableTotal(s) {
     return Math.max(0, (s.total || 0) - (s.environmental || 0));
 }
@@ -1478,7 +1367,6 @@ function statusCount(s, status) {
     return (s.by_status && s.by_status[status]) || 0;
 }
 
-// Statuses present across all batches, for the filter dropdown.
 function allStatuses() {
     var seen = {};
     batches.forEach(function(b) {
@@ -1513,8 +1401,6 @@ function fmtDelta(delta, fmt, threshold) {
     if (delta > 0) return '<span class="delta-worse">+' + fmt(abs) + '</span>';
     return '<span class="delta-better">−' + fmt(abs) + '</span>';
 }
-
-// ── Dropdown helpers ──
 
 function initDropdown(containerId, onChange) {
     var dd = el(containerId);
@@ -1568,6 +1454,11 @@ function getDropdownValue(containerId) {
     return dd ? (dd.dataset.value || '') : '';
 }
 
-document.addEventListener('click', function() {
+if (typeof document !== 'undefined') document.addEventListener('click', function() {
     document.querySelectorAll('.dropdown.open').forEach(function(d) { d.classList.remove('open'); });
 });
+
+// node test/test-app.js runs the pure helpers headlessly.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { compareVersions };
+}

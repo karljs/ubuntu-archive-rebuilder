@@ -20,7 +20,7 @@
     --tab-bar-h: 36px;
 }
 
-/* ── Loading overlay ── */
+/* Loading overlay */
 .loading-overlay {
     position: fixed; inset: 0; display: flex;
     align-items: center; justify-content: center;
@@ -35,9 +35,7 @@ body {
     overflow-y: scroll; /* always reserve scrollbar space to prevent horizontal shift */
 }
 
-/* ════════════════════════════════════════════════
-   Tab bar
-   ════════════════════════════════════════════════ */
+/* Tab bar */
 .tab-bar {
     display: flex; align-items: stretch; height: var(--tab-bar-h);
     background: var(--surface); border-bottom: 1px solid var(--border);
@@ -59,14 +57,12 @@ body {
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
-/* ════════════════════════════════════════════════
-   Overview tab
-   ════════════════════════════════════════════════ */
+/* Overview tab */
 .overview-body {
     padding: 0.75rem 1rem;
 }
 
-/* ── Success Rate Matrix ── */
+/* Success rate matrix */
 .matrix-table {
     font-family: var(--mono); font-size: 11px; border-collapse: collapse;
     width: auto; background: var(--surface);
@@ -103,7 +99,7 @@ body {
 .mpr-rate  { text-align: right; font-weight: 500; font-size: 12px; }
 .mpr-n     { text-align: right; font-size: 9px; color: var(--text-3); }
 
-/* Rate colors — left border only, no background/text color change */
+/* Rate colors: left border only */
 .rate-green  { border-left: 3px solid #1a7f37; }
 .rate-lime   { border-left: 3px solid #4a9f57; }
 .rate-yellow { border-left: 3px solid #9a6700; }
@@ -128,9 +124,7 @@ body {
 .legend-lown   { font-family: var(--mono); font-size: 10px; }
 .legend-sep    { width: 1px; height: 12px; background: var(--border); }
 
-/* ════════════════════════════════════════════════
-   Details tab
-   ════════════════════════════════════════════════ */
+/* Details tab */
 .details-toolbar {
     display: flex; align-items: center; justify-content: space-between;
     padding: 0.4rem 1rem; background: var(--surface);
@@ -209,9 +203,7 @@ body {
 }
 .ver-row:hover, .profile-row:hover { background: #f0f4ff !important; }
 
-/* ════════════════════════════════════════════════
-   Status bar (shared)
-   ════════════════════════════════════════════════ */
+/* Status bar (shared) */
 .status-bar {
     display: flex; gap: 1.5rem; padding: 5px 1rem;
     background: var(--surface); border-bottom: 1px solid var(--border);
@@ -231,9 +223,7 @@ body {
 .rate-fill { display: block; height: 100%; background: var(--green); }
 .batch-meta { margin-left: auto; color: var(--text-3); font-size: 11px; }
 
-/* ════════════════════════════════════════════════
-   Content layout (builds table + sidebar)
-   ════════════════════════════════════════════════ */
+/* Content layout (builds table + sidebar) */
 .content-columns { display: flex; gap: 0; padding: 0.5rem 1rem; }
 .col-main { flex: 1; min-width: 0; }
 .col-side {
@@ -260,7 +250,7 @@ body {
     font-size: 12px; background: var(--surface); width: 180px;
 }
 
-/* ── Issue categories sidebar ── */
+/* Issue categories sidebar */
 .findings-bar-item {
     display: flex; align-items: baseline; gap: 6px;
     padding: 2px 0; border-bottom: 1px solid var(--border-light); font-size: 11px;
@@ -272,7 +262,7 @@ body {
 /* Observation items use amber instead of implicit red */
 .findings-bar-observation .findings-bar-count { color: var(--yellow); }
 .findings-bar-observation .findings-bar-label { color: var(--text-3); }
-/* Environmental items use purple — excluded from the rate */
+/* Environmental items: purple, excluded from the rate */
 .findings-bar-environmental .findings-bar-count { color: var(--purple); }
 .findings-bar-environmental .findings-bar-label { color: var(--text-3); }
 /* Section labels */
@@ -327,9 +317,7 @@ body {
     white-space: nowrap;
 }
 
-/* ════════════════════════════════════════════════
-   Tables (shared)
-   ════════════════════════════════════════════════ */
+/* Tables (shared) */
 table {
     width: 100%; border-collapse: collapse; background: var(--surface);
     border: 1px solid var(--border); border-radius: 2px;
@@ -354,7 +342,7 @@ tbody tr:nth-child(even) { background: #fcfcfc; }
 tbody tr:nth-child(even):hover { background: #f6f8fa; }
 .pkg-name { font-family: var(--mono); font-weight: 500; font-size: 12px; }
 
-/* ── Builds table: fixed layout so columns don't shift when rows change ── */
+/* Fixed layout so columns don't shift when rows change */
 #builds-table { table-layout: fixed; width: auto; min-width: 100%; }
 #builds-table .col-package  { width: 220px; }
 #builds-table .col-status   { width: 100px; }
@@ -362,15 +350,14 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 #builds-table .col-memory   { width: 80px; }
 #builds-table .col-issues   { width: 52px; }
 #builds-table .col-actions  { width: 88px; }
-/* Truncate package names that are too long */
-/* Truncate long package names; badges/tags after the name stay visible. */
+/* Truncate long package names; badges/tags after the name stay visible */
 #builds-table td:first-child { white-space: nowrap; }
 #builds-table td:first-child .pkg-name {
     display: inline-block; vertical-align: bottom; max-width: 170px;
     overflow: hidden; text-overflow: ellipsis;
 }
 
-/* ── Status indicators ── */
+/* Status indicators */
 .st { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 500; }
 .st::before { content: ''; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
 .st-succeeded { color: var(--green); } .st-succeeded::before { background: var(--green); }
@@ -382,7 +369,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 .st-pending, .st-building { color: var(--text-3); }
 .st-pending::before, .st-building::before { background: var(--text-3); }
 
-/* ── Cell hint tooltip ── */
+/* Cell hint tooltip */
 .cell-hint { color: var(--text-3); cursor: help; position: relative; border-bottom: 1px dotted var(--text-3); }
 .cell-hint:hover::after {
     content: attr(data-hint); position: absolute; bottom: 100%; right: 0;
@@ -391,9 +378,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
     font-weight: normal; padding: 4px 8px; border-radius: 3px; white-space: nowrap; z-index: 100;
 }
 
-/* ════════════════════════════════════════════════
-   Compare tab — N-way comparison
-   ════════════════════════════════════════════════ */
+/* Compare tab */
 .compare-layout {
     display: flex; height: calc(100vh - var(--tab-bar-h)); overflow: hidden;
 }
@@ -429,7 +414,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
     flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; font-family: var(--mono); font-size: 11px;
 }
-/* Colored bar indicator — empty span, fixed width */
+/* Colored bar indicator: empty span, fixed width */
 .compare-rate-bar {
     flex-shrink: 0; width: 4px; height: 12px; border-radius: 1px;
 }
@@ -438,7 +423,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 .compare-rate-bar.rate-yellow { background: #9a6700; }
 .compare-rate-bar.rate-orange { background: #bc4c00; }
 .compare-rate-bar.rate-red    { background: #cf222e; }
-/* Rate number — fixed width so it never clips */
+/* Rate number: fixed width so it never clips */
 .compare-rate-num {
     flex-shrink: 0; font-family: var(--mono); font-size: 10px;
     color: var(--text-3); width: 30px; text-align: right;
@@ -469,7 +454,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 }
 .compare-section-collapsed td { color: var(--accent); }
 
-/* Old compare section card (used in resource tables) */
+/* Compare section card (resource tables) */
 .compare-section {
     background: var(--surface); border: 1px solid var(--border); border-radius: 2px;
     padding: 0.4rem 0.6rem; margin-top: 0.5rem;
@@ -484,9 +469,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 .delta-worse  { color: var(--red);   font-weight: 600; }
 .delta-same   { color: var(--text-3); }
 
-/* ════════════════════════════════════════════════
-   Buttons
-   ════════════════════════════════════════════════ */
+/* Buttons */
 .btn {
     padding: 3px 10px; border: 1px solid var(--border); border-radius: 2px;
     font-size: 12px; background: var(--surface); color: var(--text); cursor: pointer;
@@ -514,9 +497,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 }
 .btn-icon:hover { color: var(--text); }
 
-/* ════════════════════════════════════════════════
-   Modals
-   ════════════════════════════════════════════════ */
+/* Modals */
 .modal {
     position: fixed; inset: 0; background: rgba(0,0,0,0.45);
     display: flex; align-items: center; justify-content: center; z-index: 1000;
@@ -571,9 +552,7 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 .log-unavailable p { color: #8b949e; font-size: 13px; margin-bottom: 0.5rem; line-height: 1.5; }
 .log-unavailable p:first-child { color: #e6edf3; font-weight: 600; }
 
-/* ════════════════════════════════════════════════
-   Custom dropdown
-   ════════════════════════════════════════════════ */
+/* Custom dropdown */
 .dropdown { position: relative; display: inline-block; }
 .dropdown-toggle {
     padding: 3px 22px 3px 6px; border: 1px solid var(--border); border-radius: 2px;
@@ -600,12 +579,10 @@ tbody tr:nth-child(even):hover { background: #f6f8fa; }
 #compare-batch-a-dd .dropdown-toggle,
 #compare-batch-b-dd .dropdown-toggle { min-width: 200px; }
 
-/* ── Filter label ── */
+/* Filter label */
 .filter-label { display: flex; align-items: center; gap: 4px; font-weight: 500; font-size: 12px; color: var(--text-2); }
 
-/* ════════════════════════════════════════════════
-   Utility
-   ════════════════════════════════════════════════ */
+/* Utility */
 .hidden { display: none !important; }
 .muted  { color: var(--text-3); font-size: 12px; }
 .mono   { font-family: var(--mono); }
@@ -615,9 +592,7 @@ code {
     border: 1px solid var(--border); border-radius: 2px; padding: 0 3px;
 }
 
-/* ════════════════════════════════════════════════
-   Responsive
-   ════════════════════════════════════════════════ */
+/* Responsive */
 @media (max-width: 900px) {
     .content-columns { flex-direction: column; }
     .col-side { width: 100%; margin-left: 0; margin-top: 0.5rem; position: static; }

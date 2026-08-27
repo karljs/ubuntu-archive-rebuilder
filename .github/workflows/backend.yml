@@ -5,11 +5,15 @@ on:
     branches: [main]
     paths:
       - 'backend/**'
+      - 'frontend/**'
+      - 'test/**'
       - 'tests/**'
       - '.github/workflows/backend.yml'
   pull_request:
     paths:
       - 'backend/**'
+      - 'frontend/**'
+      - 'test/**'
       - 'tests/**'
       - '.github/workflows/backend.yml'
   workflow_dispatch:
@@ -32,6 +36,10 @@ jobs:
         with:
           workspaces: backend
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Format
         run: cargo fmt --check
 
@@ -40,6 +48,11 @@ jobs:
 
       - name: Tests
         run: cargo test
+
+      - name: Frontend checks
+        run: |
+          node --check ../frontend/app.js
+          node ../test/test-app.js
 
       - name: shellcheck
         run: |
