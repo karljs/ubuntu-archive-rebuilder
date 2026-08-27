@@ -1,17 +1,18 @@
 //! Frontend export: a stripped rebuild.db (build_log nulled) plus
-//! logs/<build-id>.log files, and a profile_configs table so the frontend
-//! doesn't parse TOML in JavaScript.
+//! logs/<build-id>.log files, a profile_configs table, and export_meta
+//! (series release order) so the frontend needs no hardcoded knowledge.
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Row, SqlitePool};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 use tokio::fs;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 // Only [[flags]] is needed; a separate struct stays forward-compatible with
@@ -69,11 +70,89 @@ pub async fn export_data(
         .context("Failed to compact export database")?;
 
     write_profile_configs(&export_pool).await?;
+    write_export_meta(&export_pool, Path::new(DISTRO_INFO_CSV)).await?;
 
     export_pool.close().await;
 
     info!(path = %db_path.display(), "Wrote export database");
     Ok(())
+}
+
+// Authoritative Ubuntu release order; rows are in release order and the
+// file covers future series. Ships with distro-info (ubuntu-dev-tools dep).
+const DISTRO_INFO_CSV: &str = "/usr/share/distro-info/ubuntu.csv";
+
+// export_meta.series_order: series present in the data, in release order.
+// Series unknown to the CSV (typos, PPAs) append by first-seen started_at.
+async fn write_export_meta(pool: &SqlitePool, distro_info: &Path) -> Result<()> {
+    let csv = match fs::read_to_string(distro_info).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Cannot read {} ({e}); series_order omitted, frontend falls back to first-seen order", distro_info.display());
+            return Ok(());
+        }
+    };
+    let known = parse_series_column(&csv);
+    if known.is_empty() {
+        warn!(
+            "{} has no usable series column; series_order omitted",
+            distro_info.display()
+        );
+        return Ok(());
+    }
+
+    let rows = sqlx::query("SELECT series, MIN(started_at) AS first FROM batches GROUP BY series")
+        .fetch_all(pool)
+        .await
+        .context("Failed to fetch series list")?;
+    let mut present: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| {
+            let series: String = r.get("series");
+            let first: String = r.get("first");
+            (series, first)
+        })
+        .collect();
+
+    let known_idx = |s: &str| known.iter().position(|k| k == s);
+    present.sort_by(|a, b| match (known_idx(&a.0), known_idx(&b.0)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)),
+    });
+    let order: Vec<&str> = present.iter().map(|(s, _)| s.as_str()).collect();
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS export_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    )
+    .execute(pool)
+    .await
+    .context("Failed to create export_meta table")?;
+    sqlx::query("INSERT OR REPLACE INTO export_meta (key, value) VALUES ('series_order', ?)")
+        .bind(serde_json::to_string(&order).context("Failed to serialise series_order")?)
+        .execute(pool)
+        .await
+        .context("Failed to insert series_order")?;
+
+    info!(count = order.len(), "Wrote export_meta.series_order");
+    Ok(())
+}
+
+fn parse_series_column(csv: &str) -> Vec<String> {
+    let mut lines = csv.lines();
+    let Some(header) = lines.next() else {
+        return vec![];
+    };
+    let Some(idx) = header.split(',').position(|c| c.trim() == "series") else {
+        return vec![];
+    };
+    lines
+        .filter_map(|l| l.split(',').nth(idx))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
@@ -367,5 +446,92 @@ mod tests {
                 .unwrap();
         export_pool.close().await;
         assert_eq!(remaining, 0, "exported db must not carry log blobs");
+    }
+
+    fn profile_for(name: &str, series: &str) -> Profile {
+        Profile {
+            compiler: Compiler {
+                compiler_type: CompilerType::Clang,
+                version: "18".to_string(),
+            },
+            target: Target {
+                series: series.to_string(),
+            },
+            flags: vec![],
+            name: name.to_string(),
+            raw_content: format!(
+                "[compiler]\ntype = \"clang\"\nversion = \"18\"\n[target]\nseries = \"{series}\"\n"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn series_order_follows_distro_info_with_unknowns_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::init(&dir.path().join("rebuilder.db")).await.unwrap();
+
+        // Fixture CSV in release order; "resolute" absent, "typo" unknown.
+        let csv = dir.path().join("ubuntu.csv");
+        std::fs::write(
+            &csv,
+            "version,codename,series,created,release\n\
+             22.04,Jammy Jellyfish,jammy,2021-10-14,2022-04-21\n\
+             24.04,Noble Numbat,noble,2023-10-12,2024-04-25\n",
+        )
+        .unwrap();
+
+        for (name, series) in [
+            ("clang-18-noble", "noble"),
+            ("clang-18-jammy", "jammy"),
+            ("clang-18-typo", "typo"),
+        ] {
+            db::create_batch(
+                &pool,
+                &profile_for(name, series),
+                BuilderBackend::Sbuild,
+                "amd64",
+            )
+            .await
+            .unwrap();
+        }
+
+        write_export_meta(&pool, &csv).await.unwrap();
+
+        let value: String =
+            sqlx::query_scalar("SELECT value FROM export_meta WHERE key = 'series_order'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let order: Vec<String> = serde_json::from_str(&value).unwrap();
+        assert_eq!(
+            order,
+            vec!["jammy".to_string(), "noble".to_string(), "typo".to_string()],
+            "known series in release order, unknown appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn series_order_skipped_when_csv_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = db::init(&dir.path().join("rebuilder.db")).await.unwrap();
+        db::create_batch(
+            &pool,
+            &profile_for("clang-18-noble", "noble"),
+            BuilderBackend::Sbuild,
+            "amd64",
+        )
+        .await
+        .unwrap();
+
+        write_export_meta(&pool, &dir.path().join("nonexistent.csv"))
+            .await
+            .unwrap();
+
+        let has_table: bool =
+            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('export_meta')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!has_table, "no export_meta when distro-info is unavailable");
     }
 }
