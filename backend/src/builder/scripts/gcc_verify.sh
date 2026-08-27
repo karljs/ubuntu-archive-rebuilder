@@ -11,14 +11,22 @@ echo "=== REBUILD: GCC baseline verification ==="
 echo "REBUILD:   /usr/bin/gcc -> $(readlink -f /usr/bin/gcc 2>/dev/null || echo 'NOT FOUND')"
 echo "REBUILD:   /usr/bin/g++ -> $(readlink -f /usr/bin/g++ 2>/dev/null || echo 'NOT FOUND')"
 
+if ! command -v gcc >/dev/null 2>&1; then
+    echo "REBUILD-ERROR: FAILED - gcc not found in chroot" >&2
+    exit 1
+fi
+
 GCC_VERSION_OUTPUT=$(gcc --version 2>&1 | head -1)
 echo "REBUILD:   gcc --version: $GCC_VERSION_OUTPUT"
 
+# grep on the output is the discriminator: a leftover clang wrapper (possible
+# in persistent schroot chroots) still exits 0, so only the output text can
+# prove gcc is really gcc.
 if echo "$GCC_VERSION_OUTPUT" | grep -qi gcc; then
     echo "REBUILD: SUCCESS - gcc confirmed"
 else
-    echo "REBUILD-WARN: gcc --version did not contain 'gcc': $GCC_VERSION_OUTPUT" >&2
-    echo "REBUILD: SUCCESS - gcc confirmed"
+    echo "REBUILD-ERROR: FAILED - gcc is not reporting as gcc: $GCC_VERSION_OUTPUT" >&2
+    exit 1
 fi
 
 echo "=== REBUILD: GCC baseline verification complete ==="

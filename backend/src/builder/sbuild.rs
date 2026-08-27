@@ -616,6 +616,9 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
                 if trimmed == "REBUILD: SUCCESS - gcc confirmed" {
                     success = true;
                 }
+                if trimmed.starts_with("REBUILD-ERROR: FAILED -") {
+                    failed = true;
+                }
                 if trimmed.starts_with("REBUILD:   gcc --version:") && trimmed.contains("gcc") {
                     version_line = Some(trimmed);
                 }
@@ -623,8 +626,12 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
         }
     }
 
-    if compiler_type == CompilerType::Clang && failed && !success {
-        return "ERROR: gcc wrapper setup FAILED - built with real GCC".into();
+    if failed && !success {
+        return match compiler_type {
+            CompilerType::Clang => "ERROR: gcc wrapper setup FAILED - built with real GCC".into(),
+            // e.g. a leftover clang wrapper in a persistent schroot chroot.
+            CompilerType::Gcc => "ERROR: gcc verification FAILED - gcc --version did not report gcc".into(),
+        };
     }
 
     if success {
@@ -730,6 +737,36 @@ mod tests {
     #[test]
     fn gcc_verify_script_contains_markers() {
         assert!(GCC_VERIFY_SCRIPT.contains("REBUILD: SUCCESS - gcc confirmed"));
+    }
+
+    #[test]
+    fn gcc_verify_script_fails_honestly() {
+        // Regression: the failure branch used to emit REBUILD-WARN *and then*
+        // "REBUILD: SUCCESS", recording broken baselines as confirmed.
+        assert!(GCC_VERIFY_SCRIPT.contains("REBUILD-ERROR: FAILED"));
+        assert!(GCC_VERIFY_SCRIPT.contains("exit 1"));
+        assert_eq!(
+            GCC_VERIFY_SCRIPT.matches("REBUILD: SUCCESS").count(),
+            1,
+            "SUCCESS marker must appear exactly once (no unconditional fallback)"
+        );
+    }
+
+    #[test]
+    fn detects_gcc_verification_failure() {
+        // e.g. a clang wrapper left in a persistent schroot chroot.
+        let log = "REBUILD:   gcc --version: Ubuntu clang version 18.1.3\n\
+                   REBUILD-ERROR: FAILED - gcc is not reporting as gcc: Ubuntu clang version 18.1.3\n";
+        let result = detect_compiler_from_log(log, CompilerType::Gcc);
+        assert!(result.contains("ERROR: gcc verification FAILED"), "got: {result}");
+        assert!(!result.contains("chroot setup failed"), "got: {result}");
+    }
+
+    #[test]
+    fn detects_gcc_missing_from_chroot() {
+        let log = "REBUILD-ERROR: FAILED - gcc not found in chroot\n";
+        let result = detect_compiler_from_log(log, CompilerType::Gcc);
+        assert!(result.contains("ERROR: gcc verification FAILED"), "got: {result}");
     }
 
     #[test]
