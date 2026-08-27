@@ -188,14 +188,16 @@ function loadBatchData(batchId) {
         [batchId]
     );
 
-    // Attempt history for retried packages: build_id -> [attempts], plus
-    // attempt counts per package.
+    // Full attempt history for retried packages (all attempts, in order).
     var attemptRows = [];
     if (exportHas.attemptNumber) {
         attemptRows = dbQuery(
             "SELECT source_package, attempt_number, status, jobs FROM builds " +
-            "WHERE batch_id = ? AND attempt_number > 1 ORDER BY source_package, attempt_number",
-            [batchId]
+            "WHERE batch_id = ? AND source_package IN (" +
+            "  SELECT source_package FROM builds WHERE batch_id = ? " +
+            "  GROUP BY source_package HAVING COUNT(*) > 1" +
+            ") ORDER BY source_package, attempt_number",
+            [batchId, batchId]
         );
     }
     var retriedPackages = {};
@@ -782,8 +784,18 @@ function renderBuildsTable() {
         var stLabel = isEnv ? 'environmental' : (b.status === 'oom_killed' ? 'oom-killed' : b.status.replace('_', ' '));
         var stCls = isEnv ? 'environmental' : b.status;
 
+        var retryBadge = '';
+        if (b.retries.length > 0) {
+            var hist = b.retries.map(function(a) {
+                var j = a.jobs != null ? ' @ ' + a.jobs + ' jobs' : '';
+                return a.status + j;
+            }).join(' → ');
+            retryBadge = ' <span class="retry-badge" title="' +
+                escapeAttr(b.retries.length + ' attempts: ' + hist) + '">⟳</span>';
+        }
+
         html += '<tr class="' + rowCls + '">' +
-            '<td><span class="pkg-name">' + escapeHtml(b.package) + '</span></td>' +
+            '<td><span class="pkg-name">' + escapeHtml(b.package) + '</span>' + retryBadge + '</td>' +
             '<td><span class="st st-' + stCls + '">' + stLabel + '</span></td>' +
             '<td class="num mono">' + (b.duration_seconds ? fmtDuration(b.duration_seconds) : '-') + '</td>' +
             '<td class="num mono">' + (b.peak_memory_mb ? b.peak_memory_mb + ' MB' : '-') + '</td>' +

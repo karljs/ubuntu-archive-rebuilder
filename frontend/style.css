@@ -313,6 +313,12 @@ body {
 .build-row-fail td { background: #fff8f8; }
 .build-row-env  td { background: #f9f6ff; }
 
+/* Retry badge: package was OOM-killed and retried */
+.retry-badge {
+    color: var(--orange); font-weight: 700; cursor: help;
+    margin-left: 4px; font-size: 12px;
+}
+
 /* ════════════════════════════════════════════════
    Tables (shared)
    ════════════════════════════════════════════════ */
