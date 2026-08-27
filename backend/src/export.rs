@@ -1,13 +1,6 @@
-//! Export module — produces a stripped SQLite database and log files for the frontend.
-//!
-//! The exported `rebuilder.db` contains all batches but with `build_log` columns
-//! nulled out, keeping the file small enough for the browser to load via sql.js.
-//! Build logs are written separately to `logs/<build-id>.log` and fetched on demand.
-//!
-//! The export also materialises a `profile_configs` table derived from the
-//! snapshotted `profile_content` TOML stored in each batch row.  This lets the
-//! frontend treat profile configurations as first-class queryable entities without
-//! parsing TOML in JavaScript.
+//! Frontend export: a stripped rebuild.db (build_log nulled) plus
+//! logs/<build-id>.log files, and a profile_configs table so the frontend
+//! doesn't parse TOML in JavaScript.
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
@@ -21,12 +14,8 @@ use tokio::fs;
 use tracing::info;
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// Minimal profile deserialisation — only the [[flags]] section is needed here.
-// Using a separate struct (not profile::Profile) so this stays forward-compatible
-// if Profile gains new fields with deny_unknown_fields.
-// ---------------------------------------------------------------------------
-
+// Only [[flags]] is needed; a separate struct stays forward-compatible with
+// Profile's deny_unknown_fields.
 #[derive(Deserialize)]
 struct ProfileForExport {
     #[serde(default)]
@@ -40,11 +29,8 @@ struct FlagForExport {
     reason: String,
 }
 
-/// Export data to the output directory.
-///
-/// Always writes a complete `rebuild.db` containing all batches.  Log files
-/// are written to `logs/<build-id>.log`; `batch_filter` controls which batches
-/// have their logs written — pass `None` to write logs for all batches.
+/// batch_filter limits which batches get log files; None writes all. The
+/// exported database always contains every batch.
 pub async fn export_data(
     pool: &SqlitePool,
     output_dir: &Path,
@@ -53,23 +39,19 @@ pub async fn export_data(
     fs::create_dir_all(output_dir).await?;
     fs::create_dir_all(output_dir.join("logs")).await?;
 
-    // Write log files from the live DB before the export copy strips them.
     write_logs(pool, output_dir, batch_filter).await?;
 
-    // Create a clean, compacted copy of the live DB.
     let db_path = output_dir.join("rebuild.db");
     if db_path.exists() {
         fs::remove_file(&db_path).await?;
     }
     let db_path_str = db_path.to_string_lossy();
-    // Single quotes in the path would terminate the SQL string literal.
     let escaped_path = db_path_str.replace('\'', "''");
     sqlx::query(&format!("VACUUM INTO '{escaped_path}'"))
         .execute(pool)
         .await
         .context("Failed to create export database")?;
 
-    // Open the export copy, null out build_log, then compact to reclaim the freed pages.
     let export_pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect(&format!("sqlite:{db_path_str}"))
@@ -94,11 +76,6 @@ pub async fn export_data(
     Ok(())
 }
 
-/// Materialise the `profile_configs` table in the export database.
-///
-/// Each row represents one distinct profile (by profile_name).  The flags are
-/// parsed from the snapshotted TOML and reduced to a human-readable summary
-/// and a full JSON representation for the frontend to use without any TOML parsing.
 async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS profile_configs (
@@ -113,8 +90,6 @@ async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
     .await
     .context("Failed to create profile_configs table")?;
 
-    // One row per distinct profile_name (profiles are snapshotted per batch but
-    // the name uniquely identifies a profile file).
     let rows = sqlx::query(
         "SELECT DISTINCT profile_name, profile_content FROM batches ORDER BY profile_name",
     )
@@ -130,8 +105,7 @@ async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
         let parsed: ProfileForExport = toml::from_str(&content)
             .with_context(|| format!("Failed to parse profile_content for '{profile_name}'"))?;
 
-        // Collect unique flag *values* (deduplicated — the same flag is often
-        // applied to both DEB_CFLAGS_APPEND and DEB_CXXFLAGS_APPEND).
+        // Unique flag values; the same flag often applies to CFLAGS and CXXFLAGS.
         let unique_flags: BTreeSet<String> = parsed.flags.iter().map(|f| f.flag.clone()).collect();
 
         let has_flags = if unique_flags.is_empty() { 0i64 } else { 1i64 };
@@ -146,7 +120,6 @@ async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
             }
         };
 
-        // Full JSON for tooltip detail: include var, flag, reason for every entry.
         let flags_json = serde_json::to_string(
             &parsed
                 .flags
@@ -183,20 +156,9 @@ async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-/// Write per-build log files from the live database.
-///
-/// Stale `.log` files from earlier exports are removed first — the frontend
-/// serves whatever sits in `logs/`, so leftovers from previous runs (other
-/// batches, since-renamed build IDs) must not survive into this export.
-///
-/// Rows are fetched one at a time (keyset pagination on the `id` primary
-/// key) instead of `fetch_all`, which would load every log blob into memory
-/// at once — a full batch's compressed logs can reach hundreds of MB.
-///
-/// Logs are stored as gzip-compressed blobs.  Each one is decompressed
-/// before writing the plain-text `.log` file so the frontend can serve them
-/// as-is.  Legacy plain-text blobs (pre-migration 004) are handled by falling
-/// back to raw UTF-8 if gzip decompression fails.
+// Stale .log files are removed first: the frontend serves whatever sits in
+// logs/. Rows stream one at a time (a full batch's compressed logs can reach
+// hundreds of MB).
 async fn write_logs(
     pool: &SqlitePool,
     output_dir: &Path,
@@ -204,7 +166,6 @@ async fn write_logs(
 ) -> Result<()> {
     let logs_dir = output_dir.join("logs");
 
-    // Remove stale logs from earlier exports.
     let mut entries = fs::read_dir(&logs_dir)
         .await
         .context("Failed to read logs directory")?;
@@ -217,8 +178,6 @@ async fn write_logs(
         }
     }
 
-    // An empty batch_filter slice is treated as "all batches"; callers pass
-    // either None or a non-empty list.
     let sql = match batch_filter {
         Some(ids) if !ids.is_empty() => {
             let placeholders = vec!["?"; ids.len()].join(",");
@@ -263,8 +222,6 @@ async fn write_logs(
     Ok(())
 }
 
-/// Decompress a gzip-compressed log blob to a String.
-/// Falls back to raw UTF-8 interpretation for legacy plain-text blobs.
 fn decompress_log(blob: &[u8]) -> String {
     let mut gz = GzDecoder::new(blob);
     let mut s = String::new();
@@ -295,7 +252,6 @@ mod tests {
             },
             flags: vec![],
             name: "clang-18-noble".to_string(),
-            // Valid TOML: export_data parses profile_content per batch.
             raw_content:
                 "[compiler]\ntype = \"clang\"\nversion = \"18\"\n[target]\nseries = \"noble\"\n"
                     .to_string(),
@@ -308,10 +264,6 @@ mod tests {
         enc.finish().unwrap()
     }
 
-    /// End-to-end export through public APIs: logs are written per build,
-    /// builds without a stored log produce no file, and stale logs from a
-    /// previous export are removed.  The row-at-a-time pagination is
-    /// exercised by having multiple builds.
     #[tokio::test]
     async fn export_writes_only_current_logs_and_removes_stale() {
         let dir = tempfile::tempdir().unwrap();
@@ -351,7 +303,6 @@ mod tests {
             .unwrap();
             build_ids.push(build.id);
         }
-        // A build with no stored log must not produce a file.
         db::insert_build(
             &pool,
             &db::NewBuild {
@@ -374,8 +325,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Stage a stale log from a "previous export" plus a non-log file,
-        // which must be left alone.
         let out = dir.path().join("export");
         fs::create_dir_all(out.join("logs")).await.unwrap();
         fs::write(out.join("logs/stale.log"), "stale")
@@ -406,7 +355,6 @@ mod tests {
             .unwrap();
         assert_eq!(foo_log, "foo log line 1\nfoo log line 2");
 
-        // Exported database must have logs stripped.
         let export_pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(&format!("sqlite:{}", out.join("rebuild.db").display()))

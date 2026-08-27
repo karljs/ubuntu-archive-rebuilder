@@ -1,16 +1,10 @@
 #!/bin/bash
-# Replaces gcc/g++/cc/c++ with clang wrappers inside the sbuild chroot.
+# Replaces gcc/g++/cc/c++ (and versioned / triple-prefixed variants) with
+# clang wrappers, as --starting-build-commands (after build-deps, before
+# dpkg-buildpackage). __CLANG_VERSION__ is substituted at runtime.
 #
-# Runs as --starting-build-commands (AFTER build-dependency installation,
-# BEFORE dpkg-buildpackage). By this point gcc is fully installed via
-# build-deps, so we can reliably divert and replace it.
-#
-# Placeholder __CLANG_VERSION__ is replaced at runtime by the pipeline.
-#
-# IMPORTANT: sbuild processes percent escapes in external command strings.
-# Any literal '%' in this script must be doubled ('%%') because sbuild
-# interprets sequences like %s before the shell sees the command.
-# See sbuild(1) § "OPTION STRING PERCENT ESCAPES".
+# sbuild expands percent escapes in external command strings: any literal '%'
+# must be doubled ('%%').
 set -e
 
 CLANG_VERSION="__CLANG_VERSION__"
@@ -27,11 +21,7 @@ echo "REBUILD:   gcc --version (pre-setup): $(gcc --version 2>/dev/null | head -
 
 mkdir -p "$WRAPPER_DIR"
 
-# Create a wrapper script that execs the given compiler.
-# The '%%s' is intentional — sbuild expands '%s' before the shell runs,
-# so we double-escape to get a literal '%s' for printf.  SC2182 flags the
-# pre-sbuild '%%' as an escaped literal; the shell that actually executes
-# this sees '%s'.
+# '%%s' reaches the shell as '%s'. SC2182: shellcheck sees pre-sbuild '%%'.
 # shellcheck disable=SC2182
 create_wrapper() {
     local name="$1"
@@ -41,13 +31,9 @@ create_wrapper() {
     echo "REBUILD:   Created wrapper: $name -> $target"
 }
 
-# Collect every gcc/g++ name present in the chroot: the plain names, all
-# versioned variants (gcc-15, g++-12, ...), and the target-triple-prefixed
-# forms (x86_64-linux-gnu-gcc[-15]).  Globs require a digit after the dash
-# so binutils front-ends (gcc-ar, gcc-nm, gcc-ranlib) are not wrapped.  A
-# hardcoded version list would silently leave newer compilers (gcc-15+ on
-# resolute) unwrapped — packages invoking them directly would compile with
-# real GCC inside a Clang batch.
+# Globs require a digit after the dash so binutils front-ends (gcc-ar,
+# gcc-nm, gcc-ranlib) are not wrapped. A hardcoded version list would miss
+# gcc-15+ and silently compile with real GCC inside a Clang batch.
 ARCH=$(dpkg-architecture -qDEB_HOST_GNU_TYPE 2>/dev/null || echo "")
 NAMES=(gcc g++ cc c++)
 for p in /usr/bin/gcc-[0-9]* /usr/bin/g++-[0-9]*; do
@@ -69,9 +55,7 @@ for name in "${NAMES[@]}"; do
     esac
 done
 
-# Replace a /usr/bin compiler binary with a symlink to our wrapper.
-# Handles both real files (dpkg-divert) and symlinks (rm + ln).
-# Appends to REPLACED so the verification pass only checks what exists.
+# Symlinks: rm + ln. Real files: dpkg-divert. Appends to REPLACED.
 REPLACED=()
 replace_compiler() {
     local name="$1"
@@ -95,7 +79,8 @@ for name in "${NAMES[@]}"; do
     replace_compiler "$name"
 done
 
-# --- Verification ---
+# Packages can invoke versioned or triple-prefixed names directly; every
+# replaced compiler must report as clang.
 echo ""
 echo "=== REBUILD: Verification ==="
 echo "REBUILD:   /usr/bin/gcc -> $(readlink -f /usr/bin/gcc 2>/dev/null || echo 'NOT FOUND')"
@@ -107,10 +92,6 @@ echo "REBUILD:   clang-$CLANG_VERSION direct test: $(/usr/bin/$CLANG_BIN --versi
 echo "REBUILD:   ls -la /usr/bin/clang*:"
 ls -la /usr/bin/clang* 2>/dev/null || echo "REBUILD:   no clang binaries found"
 
-# Every compiler we replaced must report as clang.  Packages can invoke
-# versioned or triple-prefixed names directly, so checking plain gcc alone
-# is not enough — an unwrapped binary would produce a silently-mixed
-# GCC/Clang build.
 if [ "${#REPLACED[@]}" -eq 0 ]; then
     echo "REBUILD-ERROR: FAILED - no gcc-family compiler found to wrap; clang substitution cannot work" >&2
     exit 1

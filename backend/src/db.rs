@@ -1,4 +1,4 @@
-//! Database operations — SQLite storage for batches, builds, and findings.
+//! SQLite storage for batches, builds, and findings.
 
 pub use crate::models::{Batch, Build, BuildFinding};
 use crate::models::{BuildStatus, BuilderBackend, FindingClass, FindingSeverity};
@@ -20,14 +20,8 @@ const MIGRATION_005: &str = include_str!("../migrations/005_arch_and_component.s
 const MIGRATION_006: &str = include_str!("../migrations/006_repair_findings_fk.sql");
 const MIGRATION_007: &str = include_str!("../migrations/007_oom_retry_metadata.sql");
 
-/// Aggregate build counts for a batch.
-///
-/// `environmental` holds builds that failed *only* because of environmental /
-/// infrastructure findings (e.g. a parallel-install race), not the toolchain.
-/// These are split out of `failed` so they don't count against the compiler in
-/// success-rate comparisons. `total` still counts every build, but
-/// `comparable_total()` / `toolchain_success_rate()` exclude environmental
-/// failures.
+/// `environmental` is carved out of `failed` so infra failures don't count
+/// against the compiler.
 #[derive(Debug, Default)]
 pub struct BatchStats {
     pub total: i64,
@@ -38,13 +32,10 @@ pub struct BatchStats {
     pub dep_wait: i64,
     pub timeout: i64,
     pub oom_killed: i64,
-    /// Failed builds whose findings were all environmental (excluded from
-    /// compiler comparison). Subset carved out of what would otherwise be `failed`.
     pub environmental: i64,
 }
 
 impl BatchStats {
-    /// Percentage of `part` relative to `self.total`, or 0 if total is 0.
     pub fn percent(&self, part: i64) -> f64 {
         if self.total == 0 {
             0.0
@@ -53,24 +44,12 @@ impl BatchStats {
         }
     }
 
-    /// Total builds excluding environmental-only failures — the denominator for
-    /// a fair compiler comparison.
     pub fn comparable_total(&self) -> i64 {
         self.total - self.environmental
     }
 }
 
-/// Parameters for inserting a new build record.
-///
-/// Uses borrowed strings (`&'a str`) on the insert path to avoid cloning data
-/// that is already in a local buffer. The owned `Build` type returned by query
-/// functions is a separate struct for the same reason: sqlx rows yield owned
-/// `String` values, so the two types serve different lifetimes and cannot
-/// easily be unified without unnecessary allocations.
-///
-/// `build_log` is gzip-compressed bytes.  `None` means the log was not stored
-/// (dropped by the store-logs policy).  The encoding is always gzip; there is
-/// no plain-text path for new rows.
+/// build_log is gzip bytes; None means the store-logs policy dropped it.
 pub struct NewBuild<'a> {
     pub batch_id: Uuid,
     pub source_package: &'a str,
@@ -82,19 +61,12 @@ pub struct NewBuild<'a> {
     pub compiler_detected: Option<&'a str>,
     pub submitted_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
-    /// Archive component (main / universe / restricted / multiverse).
-    /// `None` for legacy rows or bare-name package lists.
     pub component: Option<&'a str>,
     pub attempt_number: i64,
     pub jobs: Option<i64>,
     pub memory_limit_mb: Option<i64>,
 }
 
-// ---------------------------------------------------------------------------
-// Initialization
-// ---------------------------------------------------------------------------
-
-/// Open (or create) the database and ensure the schema exists.
 pub async fn init(db_path: &Path) -> Result<SqlitePool> {
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
@@ -109,9 +81,9 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
         .await
         .context("Failed to initialize schema")?;
 
-    // Run incremental migrations idempotently.
-    // ALTER TABLE … ADD COLUMN fails if the column already exists, so we
-    // check first.  This keeps the migration simple without a migrations table.
+    // Migrations are idempotent via pragma sentinels
+    // (ADD COLUMN fails if the column exists).
+    // 002: build_findings.severity.
     let has_severity: bool = sqlx::query_scalar(
         "SELECT COUNT(*) > 0 FROM pragma_table_info('build_findings') WHERE name = 'severity'",
     )
@@ -126,6 +98,7 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .context("Failed to apply migration 002")?;
     }
 
+    // 003: build_findings.finding_class.
     let has_class: bool = sqlx::query_scalar(
         "SELECT COUNT(*) > 0 FROM pragma_table_info('build_findings') WHERE name = 'finding_class'",
     )
@@ -140,10 +113,7 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .context("Failed to apply migration 003")?;
     }
 
-    // Migration 004: reshape builds.build_log from TEXT to BLOB (gzip).
-    // Detect by checking whether the column type has changed; we use the
-    // presence of the new BLOB affinity as a proxy — if the column type is
-    // still 'TEXT' the migration has not been applied yet.
+    // 004: build_log TEXT to BLOB (gzip).
     let log_col_type: Option<String> =
         sqlx::query_scalar("SELECT type FROM pragma_table_info('builds') WHERE name = 'build_log'")
             .fetch_optional(&pool)
@@ -157,9 +127,7 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .context("Failed to apply migration 004")?;
     }
 
-    // Migration 005: add batches.arch and builds.component.  Use `arch` on
-    // batches as the sentinel — both columns are added by the same migration
-    // script, so if one exists the other does too.
+    // 005: batches.arch + builds.component.
     let has_arch: bool = sqlx::query_scalar(
         "SELECT COUNT(*) > 0 FROM pragma_table_info('batches') WHERE name = 'arch'",
     )
@@ -174,12 +142,8 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .context("Failed to apply migration 005")?;
     }
 
-    // Migration 006: repair build_findings.build_id foreign keys that were
-    // repointed to the (now-dropped) builds_old table by the original
-    // migration 004.  Detected by checking where build_findings' FK
-    // actually resolves: "builds_old" means the DB was migrated by the
-    // buggy 004 and needs the repair; "builds" (or no FK row at all) means
-    // the DB is already correct.
+    // 006: repair build_findings FKs the buggy 004 repointed at the dropped
+    // builds_old table.
     let findings_fk_target: Option<String> = sqlx::query_scalar(
         "SELECT \"table\" FROM pragma_foreign_key_list('build_findings') LIMIT 1",
     )
@@ -194,9 +158,7 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
             .context("Failed to apply migration 006")?;
     }
 
-    // Migration 007: add attempt_number, jobs, memory_limit_mb to builds
-    // and relax UNIQUE constraint to allow retry attempts.  Detected by
-    // checking for the attempt_number column.
+    // 007: attempt_number / jobs / memory_limit_mb + relaxed UNIQUE for retries.
     let has_attempt_number: bool = sqlx::query_scalar(
         "SELECT COUNT(*) > 0 FROM pragma_table_info('builds') WHERE name = 'attempt_number'",
     )
@@ -214,11 +176,6 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-// ---------------------------------------------------------------------------
-// Batches
-// ---------------------------------------------------------------------------
-
-/// Create a new batch from a build profile.
 pub async fn create_batch(
     pool: &SqlitePool,
     profile: &Profile,
@@ -263,7 +220,6 @@ pub async fn create_batch(
     })
 }
 
-/// Mark a batch as finished.
 pub async fn finish_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<()> {
     sqlx::query("UPDATE batches SET finished_at = ? WHERE id = ?")
         .bind(Utc::now().to_rfc3339())
@@ -274,7 +230,6 @@ pub async fn finish_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Look up a batch by UUID.
 pub async fn get_batch(pool: &SqlitePool, id: Uuid) -> Result<Option<Batch>> {
     sqlx::query(BATCH_SELECT_BY_ID)
         .bind(id.to_string())
@@ -285,7 +240,6 @@ pub async fn get_batch(pool: &SqlitePool, id: Uuid) -> Result<Option<Batch>> {
         .transpose()
 }
 
-/// Look up a batch by name.
 pub async fn get_batch_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Batch>> {
     sqlx::query(
         "SELECT id, name, compiler_type, compiler_version, series, arch,
@@ -300,7 +254,6 @@ pub async fn get_batch_by_name(pool: &SqlitePool, name: &str) -> Result<Option<B
     .transpose()
 }
 
-/// Get the most recently started batch.
 pub async fn get_latest_batch(pool: &SqlitePool) -> Result<Option<Batch>> {
     sqlx::query(
         "SELECT id, name, compiler_type, compiler_version, series, arch,
@@ -314,7 +267,6 @@ pub async fn get_latest_batch(pool: &SqlitePool) -> Result<Option<Batch>> {
     .transpose()
 }
 
-/// List all batches, most recent first.
 pub async fn list_batches(pool: &SqlitePool) -> Result<Vec<Batch>> {
     sqlx::query(
         "SELECT id, name, compiler_type, compiler_version, series, arch,
@@ -358,11 +310,6 @@ fn batch_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Batch> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Builds
-// ---------------------------------------------------------------------------
-
-/// Insert a new build record.
 pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> {
     let id = Uuid::new_v4();
 
@@ -411,8 +358,6 @@ pub async fn insert_build(pool: &SqlitePool, b: &NewBuild<'_>) -> Result<Build> 
     })
 }
 
-/// Get all builds for a batch.  Log content is not loaded; use
-/// `get_build_log()` when it is actually needed.
 pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
@@ -430,8 +375,6 @@ pub async fn get_builds_for_batch(pool: &SqlitePool, batch_id: Uuid) -> Result<V
     .collect()
 }
 
-/// Fetch all builds across all batches, ordered by submission time.
-/// Log content is not loaded; use `get_build_log()` when needed.
 pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
     sqlx::query(
         "SELECT id, batch_id, source_package, version, status,
@@ -448,12 +391,7 @@ pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
     .collect()
 }
 
-/// Fetch and decompress the build log for a single build.
-///
-/// Returns `None` if no log was stored (dropped by store policy).
-/// The stored blob is always gzip-compressed; legacy plain-text rows written
-/// before migration 004 are handled by falling back to UTF-8 interpretation
-/// if gzip decompression fails.
+/// Falls back to raw UTF-8 for legacy pre-migration-004 plain-text rows.
 pub async fn get_build_log(pool: &SqlitePool, build_id: Uuid) -> Result<Option<String>> {
     let row = sqlx::query("SELECT build_log FROM builds WHERE id = ?")
         .bind(build_id.to_string())
@@ -465,8 +403,6 @@ pub async fn get_build_log(pool: &SqlitePool, build_id: Uuid) -> Result<Option<S
     let blob: Option<Vec<u8>> = row.get("build_log");
     let Some(bytes) = blob else { return Ok(None) };
 
-    // Try gzip first; fall back to plain UTF-8 for any pre-migration rows that
-    // were not compressed by the one-time migration script.
     let mut gz = GzDecoder::new(&bytes[..]);
     let mut s = String::new();
     if gz.read_to_string(&mut s).is_ok() {
@@ -503,11 +439,6 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Findings
-// ---------------------------------------------------------------------------
-
-/// Insert a build finding.
 // Args mirror the INSERT columns 1:1; a params struct would be ceremony.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_finding(
@@ -550,7 +481,6 @@ pub async fn insert_finding(
     })
 }
 
-/// Get all findings for a build.
 pub async fn get_findings_for_build(
     pool: &SqlitePool,
     build_id: Uuid,
@@ -568,7 +498,6 @@ pub async fn get_findings_for_build(
     .collect()
 }
 
-/// Get finding count for a build.
 pub async fn get_finding_count_for_build(pool: &SqlitePool, build_id: Uuid) -> Result<i64> {
     let row = sqlx::query("SELECT COUNT(*) as count FROM build_findings WHERE build_id = ?")
         .bind(build_id.to_string())
@@ -578,7 +507,6 @@ pub async fn get_finding_count_for_build(pool: &SqlitePool, build_id: Uuid) -> R
     Ok(row.get("count"))
 }
 
-/// Delete all findings for a build. Returns the number of rows removed.
 pub async fn delete_findings_for_build(pool: &SqlitePool, build_id: Uuid) -> Result<u64> {
     let result = sqlx::query("DELETE FROM build_findings WHERE build_id = ?")
         .bind(build_id.to_string())
@@ -608,17 +536,7 @@ fn finding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BuildFinding> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Statistics
-// ---------------------------------------------------------------------------
-
-/// Get aggregate build counts by status for a batch.
-///
-/// Only each package's *final* attempt is counted: with the OOM-retry flow,
-/// a package can have attempt 1 (oom_killed) and attempt 2 (e.g. succeeded)
-/// in the same batch.  Counting raw rows would double-count the package and
-/// skew totals and success rates.  Earlier attempts remain visible in the
-/// per-build rows; they just don't feed the aggregates.
+/// Final attempt per package only: OOM retries write multiple rows.
 pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchStats> {
     let rows = sqlx::query(
         "SELECT status, COUNT(*) as count FROM builds b
@@ -657,11 +575,7 @@ pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchS
         + stats.timeout
         + stats.oom_killed;
 
-    // Carve out "environmental" failures: failed builds that have at least one
-    // finding and whose findings are *all* environmental. These are infra
-    // artifacts (e.g. parallel-install races), not toolchain failures, so they
-    // are split out of `failed` and excluded from compiler comparison.
-    // Restricted to each package's final attempt, matching the stats query.
+    // Final attempts only, matching the stats query.
     let env_failures: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM builds b
          WHERE b.batch_id = ? AND b.status = 'failed'
@@ -685,7 +599,7 @@ pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchS
 
     Ok(stats)
 }
-/// Get findings grouped by category for a batch.
+
 pub async fn get_finding_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<(String, i64)>> {
     let rows = sqlx::query(
         "SELECT bf.category, COUNT(*) as count
@@ -706,21 +620,13 @@ pub async fn get_finding_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<Vec<
         .collect())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::{Compiler, CompilerType, Profile, Target};
     use sqlx::sqlite::SqlitePoolOptions;
 
-    /// Build an in-memory SQLite pool with the full schema + migrations applied.
-    ///
-    /// Uses `max_connections(1)` because sqlite's `:memory:` is per-connection;
-    /// a single connection keeps the schema visible across all queries in the
-    /// test.
+    // :memory: is per-connection; one connection keeps the schema visible.
     async fn mem_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -797,10 +703,6 @@ mod tests {
 
     #[tokio::test]
     async fn migration_005_is_idempotent() {
-        // Re-running the migration's ALTER TABLE would fail if the columns
-        // already exist; the init() guard prevents that. Verify by running
-        // the migration twice manually — the second should error, confirming
-        // the guard in init() is actually necessary.
         let pool = mem_pool().await;
         let result = sqlx::query(MIGRATION_005).execute(&pool).await;
         assert!(
@@ -819,7 +721,6 @@ mod tests {
 
         assert_eq!(batch.arch, "arm64");
 
-        // Round-trip via every read path.
         let by_id = get_batch(&pool, batch.id).await.unwrap().unwrap();
         assert_eq!(by_id.arch, "arm64");
 
@@ -839,8 +740,6 @@ mod tests {
 
     #[tokio::test]
     async fn create_batch_defaults_arch_to_amd64_at_caller() {
-        // The DB column has DEFAULT 'amd64', but create_batch always binds
-        // the caller's value explicitly. Verify the caller's "amd64" lands.
         let pool = mem_pool().await;
         let profile = sample_profile();
         let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
@@ -926,15 +825,8 @@ mod tests {
         assert_eq!(builds[0].component, None);
     }
 
-    /// Regression: migration 004 renamed builds → builds_old and created a
-    /// new builds table.  SQLite's ALTER TABLE RENAME rewrites FK references
-    /// in other tables to follow the rename, so build_findings.build_id
-    /// ended up pointing at the (subsequently dropped) builds_old.  Any
-    /// finding insert then failed with "no such table: main.builds_old".
-    /// Migration 004 now sets legacy_alter_table=ON to prevent the rewrite,
-    /// and migration 006 repairs databases already bitten by it.  This test
-    /// reproduces the original failure mode by inserting a finding right
-    /// after the full migration chain runs.
+    // Regression: ALTER TABLE RENAME rewrites FK references in other tables;
+    // buggy migration 004 left build_findings pointing at dropped builds_old.
     #[tokio::test]
     async fn insert_finding_after_migrations_succeeds() {
         let pool = mem_pool().await;
@@ -985,7 +877,6 @@ mod tests {
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].category, "missing_header");
 
-        // The FK target must resolve to `builds`, never `builds_old`.
         let fk_target: String = sqlx::query_scalar(
             "SELECT \"table\" FROM pragma_foreign_key_list('build_findings') LIMIT 1",
         )
@@ -995,21 +886,12 @@ mod tests {
         assert_eq!(fk_target, "builds");
     }
 
-    /// Regression for the user-facing failure: a database migrated by the
-    /// original (buggy) migration 004 has `build_findings.build_id` pointing
-    /// at the dropped `builds_old` table, so finding inserts fail with
-    /// "no such table: main.builds_old".  `init()` must detect and repair
-    /// that state via migration 006.  This test stages a broken on-disk
-    /// database (applying the buggy 004 sequence by hand) and then runs
-    /// `init()` against it.
+    // Regression: init() must repair DBs migrated by the buggy 004.
     #[tokio::test]
     async fn init_repairs_buggy_migration_004_database() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("rebuilder.db");
 
-        // Stage: schema + migrations 002/003/005, plus the *buggy* 004
-        // (no legacy_alter_table, so the rename repoints build_findings'
-        // FK at builds_old, which is then dropped).
         let staging = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
@@ -1019,8 +901,6 @@ mod tests {
         pool_exec(&staging, MIGRATION_002).await;
         pool_exec(&staging, MIGRATION_003).await;
         pool_exec(&staging, MIGRATION_005).await;
-        // Buggy 004: same as the fixed migration but WITHOUT
-        // legacy_alter_table, so the RENAME rewrites build_findings' FK.
         pool_exec(
             &staging,
             r#"
@@ -1051,7 +931,6 @@ mod tests {
             "#,
         )
         .await;
-        // Sanity: the staged DB is genuinely broken.
         let staged_fk: String = sqlx::query_scalar(
             "SELECT \"table\" FROM pragma_foreign_key_list('build_findings') LIMIT 1",
         )
@@ -1061,7 +940,6 @@ mod tests {
         assert_eq!(staged_fk, "builds_old", "test staging is broken");
         staging.close().await;
 
-        // init() should detect the dangling FK and apply migration 006.
         let pool = init(&db_path).await.expect("init repairs broken db");
 
         let repaired_fk: String = sqlx::query_scalar(
@@ -1072,7 +950,6 @@ mod tests {
         .unwrap();
         assert_eq!(repaired_fk, "builds");
 
-        // End-to-end: insert a batch → build → finding must succeed.
         let profile = sample_profile();
         let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
             .await
@@ -1147,7 +1024,6 @@ mod tests {
 
         let now = Utc::now();
 
-        // Attempt 1: OOM-killed
         insert_build(
             &pool,
             &NewBuild {
@@ -1170,7 +1046,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Attempt 2: succeeded at jobs=1 — must not violate UNIQUE
         insert_build(
             &pool,
             &NewBuild {
@@ -1203,9 +1078,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_batch_stats_counts_final_attempt_per_package() {
-        // Regression: with OOM retry, a package has attempt 1 (oom_killed) and
-        // attempt 2 (succeeded) in the same batch.  Stats must count the
-        // package once, by its final attempt — not both rows.
         let pool = mem_pool().await;
         let profile = sample_profile();
         let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
@@ -1239,7 +1111,6 @@ mod tests {
             .await
             .unwrap();
         }
-        // A second package with a single attempt, for a stable denominator.
         insert_build(
             &pool,
             &NewBuild {
@@ -1271,8 +1142,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_batch_stats_environmental_failure_excluded_from_failed() {
-        // A final-attempt failed build whose findings are all environmental
-        // is split out of `failed` (it must not count against the compiler).
         let pool = mem_pool().await;
         let profile = sample_profile();
         let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
@@ -1326,8 +1195,6 @@ mod tests {
 
     #[tokio::test]
     async fn migration_007_legacy_rows_get_defaults() {
-        // Stage a DB with the old schema (no attempt_number/jobs/memory_limit_mb),
-        // then run init() to apply migration 007, and verify defaults.
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("rebuilder.db");
 
@@ -1337,8 +1204,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Stage with the pre-007 schema (no attempt_number/jobs/memory_limit_mb,
-        // old UNIQUE constraint).
         pool_exec(
             &staging,
             r#"
@@ -1396,7 +1261,6 @@ mod tests {
         pool_exec(&staging, MIGRATION_005).await;
         pool_exec(&staging, MIGRATION_006).await;
 
-        // Insert a legacy build row (old schema, no new columns).
         let profile = sample_profile();
         let batch = create_batch(&staging, &profile, BuilderBackend::Sbuild, "amd64")
             .await
@@ -1424,10 +1288,8 @@ mod tests {
         .unwrap();
         staging.close().await;
 
-        // Run init() — should apply migration 007.
         let pool = init(&db_path).await.expect("init applies migration 007");
 
-        // Verify the legacy row got defaults.
         let row = sqlx::query(
             "SELECT attempt_number, jobs, memory_limit_mb FROM builds WHERE source_package = 'legacy-pkg'",
         )

@@ -1,7 +1,4 @@
--- Schema for rebuild experiments database.
---
--- Each batch records which compiler profile was used, so results are
--- fully reproducible.  The profile TOML is snapshotted at build time.
+-- Initial schema. Profiles are snapshotted into batches for reproducibility.
 
 CREATE TABLE IF NOT EXISTS batches (
     id TEXT PRIMARY KEY,
@@ -55,9 +52,7 @@ CREATE TABLE IF NOT EXISTS build_findings (
 CREATE INDEX IF NOT EXISTS idx_findings_build ON build_findings(build_id);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON build_findings(category);
 
--- binary_metrics is reserved for a future feature that will compare binary
--- sizes and symbol counts across compiler profiles. No Rust code reads or
--- writes this table yet.
+-- Reserved for future binary-size/symbol comparison across compilers.
 CREATE TABLE IF NOT EXISTS binary_metrics (
     id TEXT PRIMARY KEY,
     build_id TEXT NOT NULL REFERENCES builds(id),

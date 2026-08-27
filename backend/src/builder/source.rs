@@ -6,13 +6,10 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
 
-/// Wall-clock cap on a single source fetch.  A hung pull-lp-source (network
-/// stall, unresponsive mirror) must not stall the batch forever — sbuild's
-/// own timeout only covers the build phase, not this fetch.  30 minutes
-/// tolerates ~1 GB orig tarballs on slow mirrors.
+/// 30 min: ~1 GB tarballs on slow mirrors. sbuild's timeout doesn't cover
+/// this phase.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// A fetched source package, ready for sbuild.
 #[derive(Debug)]
 pub struct SourcePackage {
     pub name: String,
@@ -20,7 +17,6 @@ pub struct SourcePackage {
     pub dsc_path: PathBuf,
 }
 
-/// Download a source package from the Ubuntu archive and return the `.dsc` path.
 pub async fn fetch_source(
     package_name: &str,
     series: &str,
@@ -33,8 +29,6 @@ pub async fn fetch_source(
         .arg(package_name)
         .arg(series)
         .current_dir(work_dir)
-        // If the timeout below cancels the output() future, drop the child
-        // instead of leaking a live download process.
         .kill_on_drop(true);
 
     let output = match tokio::time::timeout(FETCH_TIMEOUT, cmd.output()).await {
@@ -63,8 +57,6 @@ pub async fn fetch_source(
     })
 }
 
-/// Find the `.dsc` file in a directory, preferring an exact package-name
-/// prefix match but falling back to any `.dsc` if only one exists.
 fn find_dsc_file(dir: &Path, package_name: &str) -> Result<PathBuf> {
     let mut exact_match: Option<PathBuf> = None;
     let mut any_dsc: Option<PathBuf> = None;
@@ -89,7 +81,6 @@ fn find_dsc_file(dir: &Path, package_name: &str) -> Result<PathBuf> {
         .with_context(|| format!("No .dsc file found for {package_name} in {}", dir.display()))
 }
 
-/// Extract version from a `.dsc` filename (e.g. `hello_2.10-3.dsc` → `2.10-3`).
 fn extract_version_from_dsc(dsc_path: &Path) -> Result<String> {
     let filename = dsc_path
         .file_name()

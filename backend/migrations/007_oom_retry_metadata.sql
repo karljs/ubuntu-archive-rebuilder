@@ -1,15 +1,6 @@
--- Add OOM retry metadata to builds: attempt_number, jobs, memory_limit_mb.
---
--- Relaxes UNIQUE(batch_id, source_package) to UNIQUE(batch_id, source_package,
--- attempt_number) so a package can have multiple build attempts in the same
--- batch (e.g. attempt 1 OOM-killed at 8 jobs, attempt 2 succeeded at 1 job).
---
--- Existing rows get attempt_number=1, jobs=NULL, memory_limit_mb=NULL (legacy
--- builds had no cgroup limit and no retry).
---
--- SQLite cannot ALTER a UNIQUE constraint in place, so this uses the same
--- table-rebuild pattern as migration 004.  legacy_alter_table prevents FK
--- rewrites in build_findings.
+-- attempt_number / jobs / memory_limit_mb; UNIQUE gains attempt_number so
+-- a package can be retried in the same batch. legacy_alter_table for the
+-- same FK reason as migration 004.
 
 PRAGMA legacy_alter_table = ON;
 PRAGMA foreign_keys = OFF;

@@ -1,11 +1,11 @@
--- Migrate build_log from TEXT to BLOB (gzip-compressed).
+-- build_log TEXT to BLOB (gzip). NULL = no log stored.
 --
--- NULL  = no log stored (dropped by store policy or not yet available).
--- BLOB  = gzip-compressed UTF-8 log bytes.  Always gzip; no encoding column
---         needed because the format is uniform for all rows post-migration.
+-- legacy_alter_table=ON is essential: without it the RENAME rewrites FK
+-- references in other tables (build_findings.build_id to builds_old), and
+-- once builds_old is dropped every finding insert fails with
+-- "no such table: main.builds_old".
 --
--- After applying this migration, compress existing plain-text rows with:
---
+-- Pre-migration plain-text rows can be compressed with:
 --   python3 -c "
 --   import sqlite3, gzip
 --   db = sqlite3.connect('rebuilder.db')
@@ -17,11 +17,6 @@
 --   db.commit()
 --   "
 
--- Use legacy_alter_table so the RENAME does NOT rewrite foreign-key
--- references in other tables (build_findings.build_id).  Without this,
--- SQLite would repoint build_findings to builds_old, and once builds_old is
--- dropped the FK would dangle — causing "no such table: main.builds_old" on
--- every finding insert.  legacy_alter_table is restored to OFF at the end.
 PRAGMA legacy_alter_table = ON;
 PRAGMA foreign_keys = OFF;
 

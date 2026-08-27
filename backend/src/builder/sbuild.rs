@@ -1,24 +1,7 @@
-//! sbuild invocation, process management, and build log analysis.
-//!
-//! Wraps each build with `/usr/bin/time -v` for resource metrics and handles
-//! timeout / Ctrl+C cancellation via process-group isolation (`setpgid` /
-//! `killpg`) so the entire sbuild process tree is cleaned up reliably.
-//!
-//! For **clang** profiles, compiler substitution happens in two phases
-//! injected into sbuild's external-command hooks:
-//!
-//! 1. **chroot-setup-commands** (before dep installation) — installs the
-//!    target clang version.
-//! 2. **starting-build-commands** (after dep installation, before
-//!    dpkg-buildpackage) — diverts gcc/g++/cc/c++ to clang wrappers and
-//!    verifies the substitution succeeded.
-//!
-//! For **gcc** profiles, the chroot setup is skipped (gcc is already
-//! present via build-deps) and a lightweight verification script records
-//! the gcc version.
-//!
-//! Profile flags are injected into the starting-build script as
-//! `DEB_*_APPEND` exports.
+//! sbuild invocation and process management. Each build runs under
+//! `/usr/bin/time -v` in its own process group (setpgid/killpg) so timeouts
+//! and Ctrl+C kill the whole tree. Clang substitution is injected via sbuild
+//! hooks: chroot-setup installs clang, starting-build wraps gcc to clang.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -40,12 +23,6 @@ use crate::models::BuildStatus;
 use crate::profile::CompilerType;
 use uuid::Uuid;
 
-/// Selects sbuild's chroot backend.
-///
-/// - `Unshare`: ephemeral chroots via user namespaces (default, no root needed).
-/// - `Schroot`: persistent schroot directory chroots (requires pre-created
-///   chroot, but build deps persist across builds and compilers can be
-///   pre-installed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChrootMode {
     Unshare,
@@ -81,27 +58,18 @@ impl std::fmt::Display for ChrootMode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shell script templates — loaded at compile time from external files so they
-// can be linted with shellcheck independently.  Placeholders are substituted
-// at runtime.
-// ---------------------------------------------------------------------------
-
+// Shellcheck-linted script templates; placeholders substituted at runtime.
 const CHROOT_SETUP_SCRIPT: &str = include_str!("scripts/chroot_setup.sh");
 const STARTING_BUILD_SCRIPT: &str = include_str!("scripts/starting_build.sh");
 const GCC_VERIFY_SCRIPT: &str = include_str!("scripts/gcc_verify.sh");
 const SBUILD_CONFIG_TEMPLATE: &str = include_str!("scripts/sbuild_config.pl.tmpl");
 
-/// Configuration for a single sbuild invocation.
 pub struct SbuildConfig {
     pub dsc_path: PathBuf,
     pub series: String,
-    /// Target build architecture (e.g. "amd64").  Passed to sbuild as
-    /// `--arch=<arch>`.  Defaults to "amd64" at the CLI layer.
     pub arch: String,
     pub compiler_type: CompilerType,
     pub compiler_version: String,
-    /// Extra environment variables for the build (from profile flags).
     pub build_env: Vec<(String, String)>,
     pub timeout_seconds: u64,
     pub verbose: bool,
@@ -109,11 +77,9 @@ pub struct SbuildConfig {
     pub jobs: usize,
     pub cancel_token: CancellationToken,
     pub memory_limit_mb: u64,
-    /// sbuild chroot backend: unshare (ephemeral) or schroot (persistent).
     pub chroot_mode: ChrootMode,
 }
 
-/// Outcome of a single sbuild run, before database insertion.
 pub struct SbuildResult {
     pub status: BuildStatus,
     pub log: String,
@@ -123,29 +89,14 @@ pub struct SbuildResult {
     pub memory_limit_mb: Option<u64>,
 }
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
-/// Build a single `.dsc` with sbuild, capturing output and resource metrics.
-///
-/// The build is wrapped with `/usr/bin/time -v` for wall-time and peak-RSS
-/// measurement.  Timeout and cancellation are handled in Rust (not via the
-/// `timeout(1)` command) to avoid process-hierarchy issues that caused
-/// orphaned chroot processes in earlier iterations.
+/// Timeout/cancellation in Rust, not timeout(1): process-hierarchy issues
+/// with timeout(1) orphaned chroot processes in earlier iterations.
 pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     let build_id = Uuid::new_v4();
     let (mut cmd, _config_file, scope_name) = build_command(config, build_id)?;
 
     debug!("Spawning: {:?}", cmd);
 
-    // When memory_limit_mb > 0, build_command wraps sbuild in
-    // `systemd-run --scope --property=MemoryMax=<bytes>`.  systemd creates
-    // the cgroup under user@UID.service (which has Delegate=yes), so the
-    // process starts inside the memory-limited cgroup — no manual PID
-    // migration needed.  OOM detection reads memory.events after the build
-    // but before child.wait() returns (the scope still exists in that window
-    // because systemd-run is still alive collecting the exit code).
     let mut child = cmd.spawn().context("Failed to spawn sbuild")?;
     let child_pid = child.id().context("Failed to get child PID")?;
     let pgid = Pid::from_raw(child_pid as i32);
@@ -232,10 +183,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         }
     }
 
-    // Read OOM status BEFORE child.wait().  At this point the pipes have
-    // closed (sbuild exited) but systemd-run is still alive collecting the
-    // exit code, so the scope's cgroup still exists.  After child.wait()
-    // returns, systemd-run exits and systemd cleans up the scope.
+    // Must be read before child.wait(); see SystemdScopeCgroup.
     let scope_cgroup =
         scope_name
             .as_deref()
@@ -259,9 +207,6 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         infer_status(&log, exit_code)
     };
 
-    // Check if the build was OOM-killed by the cgroup. This overrides
-    // the inferred status because a cgroup OOM kill is the authoritative
-    // cause of failure.
     let (final_status, final_memory_limit_mb) = if let Some(cg) = scope_cgroup {
         let oom_killed = cg.read_oom_kill().unwrap_or(false);
         let limit = Some(config.memory_limit_mb);
@@ -272,8 +217,8 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         };
         (status, limit)
     } else if scope_name.is_some() {
-        // We used systemd-run but couldn't read the scope cgroup (race lost).
-        // The memory limit was still enforced; we just can't detect OOM.
+        // Scope reaped before memory.events could be read: detection lost,
+        // enforcement not.
         (status, Some(config.memory_limit_mb))
     } else {
         (status, None)
@@ -289,34 +234,15 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Command construction
-// ---------------------------------------------------------------------------
-
-/// HTTP(S) proxy URL injected into the sbuild chroot's apt configuration (see
-/// `chroot_setup.sh`).  sbuild's unshare chroot does not inherit the outer
-/// shell's `http_proxy` / `https_proxy` env vars, so the pipeline forwards
-/// the proxy explicitly via `REBUILD_HTTP_PROXY`.  Empty/unset leaves apt's
-/// default config untouched.
+// The unshare chroot doesn't inherit http_proxy/https_proxy from the
+// environment; REBUILD_HTTP_PROXY forwards one into apt's config.
 fn http_proxy_for_chroot() -> String {
     std::env::var("REBUILD_HTTP_PROXY").unwrap_or_default()
 }
 
-/// Assemble the full `Command` for `/usr/bin/time -v sbuild ...`.
-///
-/// For clang profiles, injects chroot-setup (clang install) and
-/// starting-build (gcc-to-clang wrapper) scripts. For gcc profiles,
-/// only injects a lightweight verification script.
-///
-/// When `memory_limit_mb > 0`, the command is wrapped in
-/// `systemd-run --user --scope --property=MemoryMax=<bytes>` so that
-/// systemd creates a transient scope under the user manager
-/// (`user@UID.service`), which has `Delegate=yes` and thus allows cgroup
-/// memory limiting even when the rebuilder process itself is in a session
-/// scope that doesn't have cgroup delegation.
-///
-/// Returns the command, the temporary sbuild config file, and the optional
-/// systemd scope unit name (for OOM detection after the build).
+// memory_limit_mb > 0 wraps the command in systemd-run --user --scope
+// --property=MemoryMax: the scope lives under user@UID.service (Delegate=yes),
+// so memory limiting works without cgroup delegation on our own process.
 fn build_command(
     config: &SbuildConfig,
     build_id: Uuid,
@@ -330,7 +256,6 @@ fn build_command(
         config.chroot_mode,
     )?;
 
-    // Collect sbuild arguments (everything after `/usr/bin/time -v sbuild`).
     let mut sbuild_args: Vec<String> = vec![
         "--verbose".into(),
         "--batch".into(),
@@ -342,9 +267,7 @@ fn build_command(
 
     match config.chroot_mode {
         ChrootMode::Unshare => {
-            // sbuild's unshare mode extracts chroots into $TMPDIR which
-            // defaults to /tmp. On this machine /tmp is a 44 GB tmpfs and
-            // large builds exhaust it, so redirect to real disk instead.
+            // unshare extracts chroots into $TMPDIR (default /tmp, tmpfs).
             let scratch_dir = PathBuf::from("/var/tmp/rebuild-builds");
             std::fs::create_dir_all(&scratch_dir)
                 .context("Failed to create /var/tmp/rebuild-builds")?;
@@ -353,11 +276,8 @@ fn build_command(
             tmpdir = Some(scratch_dir);
         }
         ChrootMode::Schroot => {
-            // No --chroot-mode flag: schroot is sbuild's default. Purge
-            // settings are controlled via the generated config file so
-            // that $purge_build_deps = 'never' is not overridden by CLI.
-            // No TMPDIR: schroot uses its own chroot directory, not a
-            // tarball extracted into TMPDIR.
+            // schroot is the default; purge lives in the generated config so
+            // $purge_build_deps = 'never' isn't overridden.
         }
     }
 
@@ -389,8 +309,6 @@ fn build_command(
     sbuild_args.push("--no-clean-source".into());
     sbuild_args.push(config.dsc_path.to_string_lossy().into_owned());
 
-    // Build the outer command, optionally wrapping in systemd-run for
-    // cgroup memory limiting.
     let scope_name = if config.memory_limit_mb > 0 {
         Some(format!("rebuild-{build_id}.scope"))
     } else {
@@ -433,9 +351,9 @@ fn build_command(
         cmd.env("TMPDIR", td);
     }
 
-    // Spawn in its own process group so we can `killpg` the entire tree.
-    // SAFETY: `setpgid` is async-signal-safe (POSIX.1-2017 §2.4.3), which is
-    // the only requirement for code inside `pre_exec`.
+    // Own process group so killpg reaches the whole tree.
+    // SAFETY: setpgid is async-signal-safe (POSIX.1-2017 §2.4.3), the only
+    // requirement for pre_exec.
     unsafe {
         cmd.pre_exec(|| {
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
@@ -447,9 +365,7 @@ fn build_command(
     Ok((cmd, sbuild_config_file, scope_name))
 }
 
-/// Wrap a shell script body in a heredoc that writes it to a temp file inside
-/// the chroot and then executes it.  This is how sbuild external commands
-/// receive multi-line scripts.
+// sbuild external commands receive multi-line scripts via this heredoc form.
 fn wrap_in_heredoc(filename: &str, delimiter: &str, body: &str) -> String {
     format!(
         "cat > /tmp/{filename} << '{delimiter}'\n\
@@ -459,16 +375,8 @@ fn wrap_in_heredoc(filename: &str, delimiter: &str, body: &str) -> String {
     )
 }
 
-/// Generate a Perl config file that overrides the user's `~/.sbuildrc`.
-///
-/// Loaded via `SBUILD_CONFIG` which sbuild evaluates after system and user
-/// configs, so all assignments here take precedence. Profile flags are
-/// injected into `$build_environment` so they reach `dpkg-buildpackage`.
-///
-/// Purge behaviour depends on the chroot mode:
-/// - `unshare`: deps purged always (ephemeral chroot, no reuse possible).
-/// - `schroot`: deps purged never (persistent chroot, deps accumulate for
-///   faster subsequent builds).
+// SBUILD_CONFIG is loaded after ~/.sbuildrc, so it wins. Purge: unshare
+// purges always (ephemeral), schroot never (deps accumulate).
 fn generate_sbuild_config(
     jobs: usize,
     run_tests: bool,
@@ -477,13 +385,11 @@ fn generate_sbuild_config(
 ) -> Result<tempfile::NamedTempFile> {
     let nocheck = if run_tests { "" } else { " nocheck" };
 
-    // Build the Perl hash entries for $build_environment. Each entry is a
-    // bare key-value pair; the template provides the surrounding indentation.
     let mut env_entries = vec![format!(
         "'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',"
     )];
     for (var, value) in build_env {
-        // Perl single-quote escaping: ' becomes '\''
+        // Perl single-quote escaping.
         let escaped = value.replace('\'', "'\\''");
         env_entries.push(format!("'{var}' => '{escaped}',"));
     }
@@ -511,11 +417,6 @@ fn generate_sbuild_config(
     Ok(file)
 }
 
-// ---------------------------------------------------------------------------
-// Process management
-// ---------------------------------------------------------------------------
-
-/// Kill an entire process group: SIGTERM, wait 10 s, then SIGKILL.
 async fn kill_process_group(pgid: Pid) {
     if let Err(e) = killpg(pgid, Signal::SIGTERM) {
         warn!("Failed to SIGTERM process group {pgid}: {e}");
@@ -527,12 +428,7 @@ async fn kill_process_group(pgid: Pid) {
     }
 }
 
-/// Drain remaining pipe data so a killed child doesn't block on a full buffer.
-///
-/// Lines are kept: on a timeout or interrupt kill the final lines are the
-/// most diagnostic output a hung build produced, so they are classified
-/// into `log_lines` / `time_output` exactly like the main read loop rather
-/// than discarded.
+// The final lines of a killed build are the most diagnostic; keep them.
 async fn drain_pipes(
     stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stderr: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
@@ -567,9 +463,7 @@ async fn drain_pipes(
     .await;
 }
 
-/// Route a stderr line: `/usr/bin/time -v` output goes to `time_output`,
-/// everything else is build log content.  Shared by the main read loop and
-/// the post-kill drain so both classify identically.
+// /usr/bin/time -v output goes to time_output, the rest to the build log.
 fn classify_stderr_line(line: String, log_lines: &mut Vec<String>, time_output: &mut String) {
     if is_time_output(&line) {
         time_output.push_str(&line);
@@ -579,10 +473,7 @@ fn classify_stderr_line(line: String, log_lines: &mut Vec<String>, time_output: 
     }
 }
 
-/// Return `true` if this stderr line looks like `/usr/bin/time -v` output
-/// rather than sbuild output that should go into the build log.
 fn is_time_output(line: &str) -> bool {
-    // /usr/bin/time -v prefixes every line with a recognisable label
     line.contains("time (seconds):")
         || line.contains("Maximum resident set size")
         || line.contains("Exit status:")
@@ -595,47 +486,25 @@ fn is_time_output(line: &str) -> bool {
         || line.contains("Involuntary context switches")
 }
 
-// ---------------------------------------------------------------------------
-// Build log analysis
-// ---------------------------------------------------------------------------
-
-/// Examine the build log for `REBUILD:` verification markers to confirm
-/// the expected compiler was used.
-///
-/// For clang builds, checks that gcc was successfully replaced with clang.
-/// For gcc builds, checks that gcc was confirmed present.
-///
-/// sbuild echoes the full script source before executing it, so markers
-/// appearing inside `echo "…"` lines are skipped — only actual output lines
-/// (those starting at column 0 with the marker prefix) are considered.
-///
-/// If neither the success nor the wrapper-failure markers are present, the
-/// chroot-setup phase (which installs clang inside the unshare chroot) is
-/// suspected of having failed before the verification script could run.
-/// Network/proxy errors during `apt-get install clang-NN` are the usual
-/// cause; those emit `REBUILD-ERROR: ...` markers from `chroot_setup.sh`
-/// which we surface here rather than reporting the opaque "UNKNOWN".
+// sbuild echoes the full script source before executing it, so markers
+// inside `echo "..."` lines are skipped: only real output counts. If
+// verification never ran, a chroot_setup REBUILD-ERROR (typically an
+// apt/proxy failure) is surfaced instead of "UNKNOWN".
 fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
     let mut success = false;
     let mut failed = false;
     let mut version_line: Option<&str> = None;
-    // First `REBUILD-ERROR:` line emitted by chroot_setup.sh, captured so we
-    // can report the underlying cause (e.g. apt failure) rather than a bare
-    // "no verification markers found".
     let mut chroot_setup_error: Option<&str> = None;
 
     for line in log.lines() {
         let trimmed = line.trim();
 
-        // Skip lines that are part of the echoed script source
         if trimmed.starts_with("echo ") || trimmed.starts_with('"') || trimmed.starts_with('\'') {
             continue;
         }
 
-        // Capture chroot-setup failures regardless of compiler type — they
-        // abort the build before the verification phase runs.  Verification
-        // failures ("REBUILD-ERROR: FAILED - ...") are a separate family
-        // handled below and must not be captured here.
+        // "FAILED -" is verification failure, handled below; anything else
+        // is a chroot-setup error.
         if chroot_setup_error.is_none()
             && trimmed.starts_with("REBUILD-ERROR:")
             && !trimmed.starts_with("REBUILD-ERROR: FAILED -")
@@ -648,9 +517,6 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
                 if trimmed == "REBUILD: SUCCESS - gcc is now clang" {
                     success = true;
                 }
-                // The whole "FAILED -" family: the legacy gcc-specific marker
-                // and the per-compiler verification failures from the
-                // versioned/triple-prefixed wrapper checks.
                 if trimmed.starts_with("REBUILD-ERROR: FAILED -") {
                     failed = true;
                 }
@@ -675,7 +541,6 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
     if failed && !success {
         return match compiler_type {
             CompilerType::Clang => "ERROR: gcc wrapper setup FAILED - built with real GCC".into(),
-            // e.g. a leftover clang wrapper in a persistent schroot chroot.
             CompilerType::Gcc => {
                 "ERROR: gcc verification FAILED - gcc --version did not report gcc".into()
             }
@@ -696,9 +561,6 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
         return format!("{label} confirmed");
     }
 
-    // The verification script never ran.  If the chroot-setup phase emitted
-    // an error marker (e.g. apt couldn't install clang through a proxy),
-    // surface that as the proximate cause.
     if let Some(err) = chroot_setup_error {
         return format!("ERROR: chroot setup failed - {err}");
     }
@@ -706,15 +568,9 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
     "UNKNOWN: no compiler verification markers found in log".into()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- shell script generation --------------------------------------------
 
     #[test]
     fn chroot_setup_substitutes_version() {
@@ -724,7 +580,6 @@ mod tests {
         assert!(script.contains(r#"CLANG_VERSION="19""#));
         assert!(!script.contains("__CLANG_VERSION__"));
         assert!(!script.contains("__HTTP_PROXY__"));
-        // Empty proxy must leave the if-branch dead: `if [ -n "" ]` is false.
         assert!(script.contains("if [ -n \"\" ]; then"));
     }
 
@@ -733,8 +588,6 @@ mod tests {
         let script = CHROOT_SETUP_SCRIPT
             .replace("__CLANG_VERSION__", "19")
             .replace("__HTTP_PROXY__", "http://proxy.example:3128");
-        // The script source keeps its backslash-escaped quotes literally, so
-        // check the substituted URL appears in both Proxy lines.
         assert!(script.contains("Acquire::http::Proxy"));
         assert!(script.contains("Acquire::https::Proxy"));
         assert!(script.contains("http://proxy.example:3128"));
@@ -758,9 +611,6 @@ mod tests {
 
     #[test]
     fn starting_build_wraps_versioned_compilers_dynamically() {
-        // The wrapper list must be glob-driven, not a hardcoded 9..14 range:
-        // resolute's default gcc is 15+, and an unwrapped gcc-15 would let
-        // packages silently compile with real GCC inside a Clang batch.
         assert!(STARTING_BUILD_SCRIPT.contains("gcc-[0-9]*"));
         assert!(STARTING_BUILD_SCRIPT.contains("g++-[0-9]*"));
         assert!(STARTING_BUILD_SCRIPT.contains("-gcc-[0-9]*"));
@@ -769,7 +619,6 @@ mod tests {
 
     #[test]
     fn starting_build_verifies_every_replaced_compiler() {
-        // Verification must iterate over the replaced set, not just gcc.
         assert!(STARTING_BUILD_SCRIPT.contains("\"${REPLACED[@]}\""));
         assert!(STARTING_BUILD_SCRIPT.contains("compiler verification failed"));
     }
@@ -787,8 +636,6 @@ mod tests {
 
     #[test]
     fn gcc_verify_script_fails_honestly() {
-        // Regression: the failure branch used to emit REBUILD-WARN *and then*
-        // "REBUILD: SUCCESS", recording broken baselines as confirmed.
         assert!(GCC_VERIFY_SCRIPT.contains("REBUILD-ERROR: FAILED"));
         assert!(GCC_VERIFY_SCRIPT.contains("exit 1"));
         assert_eq!(
@@ -800,9 +647,8 @@ mod tests {
 
     #[test]
     fn detects_gcc_verification_failure() {
-        // e.g. a clang wrapper left in a persistent schroot chroot.
         let log = "REBUILD:   gcc --version: Ubuntu clang version 18.1.3\n\
-                   REBUILD-ERROR: FAILED - gcc is not reporting as gcc: Ubuntu clang version 18.1.3\n";
+                    REBUILD-ERROR: FAILED - gcc is not reporting as gcc: Ubuntu clang version 18.1.3\n";
         let result = detect_compiler_from_log(log, CompilerType::Gcc);
         assert!(
             result.contains("ERROR: gcc verification FAILED"),
@@ -831,8 +677,6 @@ mod tests {
 
     #[test]
     fn stderr_line_classification_separates_time_output() {
-        // The drain-after-kill path must keep the same split as the main
-        // read loop: /usr/bin/time lines to metrics, build lines to the log.
         let mut log_lines = Vec::new();
         let mut time_output = String::new();
 
@@ -857,8 +701,6 @@ mod tests {
         assert!(time_output.contains("Exit status: 137"));
         assert_eq!(time_output.lines().count(), 2);
     }
-
-    // -- detect_compiler_from_log -------------------------------------------
 
     #[test]
     fn detects_clang_confirmed() {
@@ -916,11 +758,8 @@ mod tests {
 
     #[test]
     fn chroot_setup_apt_failure_is_surfaced() {
-        // apt-get install clang-NN failed inside the chroot (e.g. no proxy).
-        // chroot_setup.sh emits REBUILD-ERROR and exits 1 before the
-        // starting-build verification script ever runs.
         let log = "=== REBUILD: Installing Clang 18 ===\n\
-                   REBUILD-ERROR: Failed to install clang-18 (check proxy / archive reachability)\n";
+                    REBUILD-ERROR: Failed to install clang-18 (check proxy / archive reachability)\n";
         let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(
             result.starts_with("ERROR: chroot setup failed"),
@@ -934,8 +773,6 @@ mod tests {
 
     #[test]
     fn chroot_setup_error_does_not_override_wrapper_failure() {
-        // If the wrapper setup also failed, that's the more specific failure
-        // and should win over the earlier chroot-setup warning.
         let log = concat!(
             "REBUILD-ERROR: Failed to install clang-18 (check proxy / archive reachability)\n",
             "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n",
@@ -946,8 +783,6 @@ mod tests {
 
     #[test]
     fn chroot_setup_error_marker_not_confused_with_wrapper_error() {
-        // The wrapper-failure marker also starts with REBUILD-ERROR: but must
-        // not be mis-attributed to chroot setup.
         let log = "REBUILD-ERROR: FAILED - gcc is NOT reporting as clang!\n";
         let result = detect_compiler_from_log(log, CompilerType::Clang);
         assert!(result.contains("wrapper setup FAILED"), "got: {result}");
@@ -955,9 +790,6 @@ mod tests {
 
     #[test]
     fn generic_verification_failure_marker_detected() {
-        // Newer starting_build.sh emits a generic verification-failure
-        // marker listing the offending compilers (versioned/triple-prefixed
-        // wrappers that still resolve to GCC).
         let log = concat!(
             "REBUILD-ERROR: FAILED - gcc-15 is NOT reporting as clang!\n",
             "REBUILD-ERROR: FAILED - compiler verification failed: gcc-15\n",
@@ -967,8 +799,6 @@ mod tests {
         assert!(result.contains("wrapper setup FAILED"), "got: {result}");
         assert!(!result.contains("chroot setup failed"), "got: {result}");
     }
-
-    // -- ChrootMode ---------------------------------------------------------
 
     #[test]
     fn chroot_mode_parse_unshare() {
@@ -990,8 +820,6 @@ mod tests {
     fn chroot_mode_parse_invalid() {
         assert!("docker".parse::<ChrootMode>().is_err());
     }
-
-    // -- generate_sbuild_config purge behaviour -----------------------------
 
     #[test]
     fn sbuild_config_unshare_purges_deps_always() {

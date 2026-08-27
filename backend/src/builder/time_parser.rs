@@ -3,25 +3,6 @@
 use crate::models::ResourceMetrics;
 use tracing::warn;
 
-/// Parse the output of `/usr/bin/time -v` to extract resource metrics.
-///
-/// Returns a fully populated `ResourceMetrics` on success. Individual fields
-/// are `None` when their line is absent from the output. If the output string
-/// is non-empty but no recognised field is found, a warning is logged so that
-/// silent failures don't go unnoticed in production runs.
-///
-/// The output format looks like:
-/// ```text
-///     Command being timed: "some command"
-///     User time (seconds): 123.45
-///     System time (seconds): 12.34
-///     Percent of CPU this job got: 95%
-///     Elapsed (wall clock) time (h:mm:ss or m:ss): 2:15:30
-///     ...
-///     Maximum resident set size (kbytes): 1048576
-///     ...
-///     Exit status: 0
-/// ```
 pub fn parse_time_output(output: &str) -> ResourceMetrics {
     let mut metrics = ResourceMetrics::default();
 
@@ -47,29 +28,23 @@ pub fn parse_time_output(output: &str) -> ResourceMetrics {
         && metrics.exit_status.is_none()
         && metrics.wall_time_seconds.is_none()
     {
-        warn!("Non-empty /usr/bin/time output but no recognisable fields parsed — check time output format");
+        warn!("Non-empty /usr/bin/time output but no recognisable fields parsed; check format");
     }
 
     metrics
 }
 
-/// Parse wall time in format "h:mm:ss" or "m:ss" or "ss.ss"
 fn parse_wall_time(s: &str) -> Option<f64> {
     let parts: Vec<&str> = s.split(':').collect();
 
     match parts.len() {
-        1 => {
-            // Just seconds (possibly with decimals)
-            parts[0].parse().ok()
-        }
+        1 => parts[0].parse().ok(),
         2 => {
-            // m:ss or m:ss.ss
             let minutes: f64 = parts[0].parse().ok()?;
             let seconds: f64 = parts[1].parse().ok()?;
             Some(minutes * 60.0 + seconds)
         }
         3 => {
-            // h:mm:ss or h:mm:ss.ss
             let hours: f64 = parts[0].parse().ok()?;
             let minutes: f64 = parts[1].parse().ok()?;
             let seconds: f64 = parts[2].parse().ok()?;
@@ -170,7 +145,7 @@ mod tests {
         assert_eq!(metrics.user_time_seconds, Some(45.23));
         assert_eq!(metrics.system_time_seconds, Some(12.87));
         assert_eq!(metrics.peak_memory_kb, Some(524288));
-        assert_eq!(metrics.wall_time_seconds, Some(65.12)); // 1:05.12 = 65.12 seconds
+        assert_eq!(metrics.wall_time_seconds, Some(65.12));
         assert_eq!(metrics.exit_status, Some(0));
     }
 

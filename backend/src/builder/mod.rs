@@ -1,5 +1,4 @@
-//! Build orchestration — runs a batch of package builds sequentially,
-//! recording results to the database and handling Ctrl+C gracefully.
+//! Sequential batch orchestration with Ctrl+C handling.
 
 mod cgroup;
 mod sbuild;
@@ -24,35 +23,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-/// Parameters for a full batch build run (multiple packages).
 pub struct BuildConfig {
     pub profile: Profile,
-    /// `(package_name, optional archive component)` for each package to build.
-    /// The component is forwarded to the per-build DB row when present, so
-    /// results can be sliced by main / universe / etc.
+    /// (package, optional component); component lands in the DB row.
     pub packages: Vec<(String, Option<String>)>,
     pub timeout_seconds: u64,
     pub verbose: bool,
     pub run_tests: bool,
     pub jobs: usize,
-    /// Log storage policy.  Defaults to `All` (backward-compatible).
     pub store_logs: StoreLogs,
-    /// Base directory for source package downloads.
-    /// Defaults to `/var/tmp/rebuild-source` (real disk, not tmpfs).
+    /// Real disk: /tmp is often tmpfs and tarballs are large.
     pub source_dir: PathBuf,
-    /// Target build architecture.  Passed to sbuild as `--arch=<arch>`.
     pub arch: String,
-    /// Memory limit for the build cgroup, in MiB.  0 means no limit.
     pub memory_limit_mb: u64,
-    /// sbuild chroot backend: unshare (ephemeral) or schroot (persistent).
     pub chroot_mode: ChrootMode,
 }
 
-/// Run a batch of builds, recording each result to the database.
-///
-/// Builds are executed sequentially.  Returns the batch ID and aggregate
-/// statistics.  A Ctrl+C during any build cancels the current build and
-/// skips all remaining packages.
+/// Ctrl+C cancels the current build and skips the rest.
 pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid, BatchStats)> {
     let batch =
         db::create_batch(pool, &config.profile, BuilderBackend::Sbuild, &config.arch).await?;
@@ -79,8 +66,6 @@ pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid,
         cancel_signal.cancel();
     });
 
-    // Verify cgroup v2 availability for memory limiting. If unavailable,
-    // builds run without protection (graceful degradation).
     if config.memory_limit_mb > 0 {
         match std::fs::read_to_string("/proc/self/cgroup") {
             Ok(content) => {
@@ -125,15 +110,11 @@ pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid,
                         result.status.as_str()
                     );
                     let status = result.status;
-                    // A failed DB write must not abort a long-running batch
-                    // (the build itself already succeeded or failed); log it
-                    // and move on to the next package.
                     if let Err(e) = store_build_result(pool, batch.id, &result, config).await {
                         error!("{progress} {package_name}: failed to store build result: {e}");
                         break;
                     }
 
-                    // Retry only if OOM-killed on first attempt with jobs > 1.
                     if status == BuildStatus::OomKilled && attempt == 1 && current_jobs > 1 {
                         info!("{progress} {package_name} OOM-killed at {current_jobs} jobs, retrying at 1 job");
                         attempt = 2;
@@ -186,7 +167,6 @@ pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid,
     Ok((batch.id, stats))
 }
 
-/// Build a single source package: fetch source, run sbuild, log compiler status.
 async fn build_package(
     package_name: &str,
     component: Option<&str>,
@@ -195,8 +175,7 @@ async fn build_package(
     attempt: u32,
     cancel_token: CancellationToken,
 ) -> Result<BuildResult> {
-    // Use a temp dir on real disk (not the RAM-backed /tmp tmpfs) to avoid
-    // exhausting RAM with large source tarballs during long build runs.
+    // Real disk: /tmp tmpfs + big tarballs = OOM host.
     std::fs::create_dir_all(&config.source_dir).with_context(|| {
         format!(
             "Failed to create source dir {}",
@@ -257,11 +236,7 @@ async fn build_package(
     })
 }
 
-/// Persist a build result: scan for findings, then store according to policy.
-///
-/// Findings are extracted first (while the log is in memory) so they are always
-/// captured regardless of the store-logs policy.  The log is then compressed and
-/// stored or dropped based on `config.store_logs`.
+/// Findings are extracted before the log is maybe dropped per store-logs.
 async fn store_build_result(
     pool: &SqlitePool,
     batch_id: Uuid,
@@ -270,7 +245,6 @@ async fn store_build_result(
 ) -> Result<()> {
     let now = chrono::Utc::now();
 
-    // Scan findings first, while the log is still in memory.
     let findings =
         if result.status.should_scan_for_errors() || result.status.should_scan_for_observations() {
             scan_log(&result.build_log, result.status)
@@ -278,7 +252,6 @@ async fn store_build_result(
             vec![]
         };
 
-    // Decide whether to store the log based on policy.
     let log_blob: Option<Vec<u8>> = match config.store_logs {
         StoreLogs::None => None,
         StoreLogs::Failures if result.status == BuildStatus::Succeeded => None,
@@ -323,7 +296,6 @@ async fn store_build_result(
     Ok(())
 }
 
-/// Gzip-compress bytes, returning the compressed form.
 fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder

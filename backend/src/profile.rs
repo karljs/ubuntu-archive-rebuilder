@@ -1,19 +1,10 @@
-//! Build profile loading and validation.
-//!
-//! A profile is a TOML file that describes the compiler configuration for a
-//! batch of builds: which compiler to use, which Ubuntu series to target, and
-//! any extra flags to inject via `DEB_*_APPEND` environment variables.
-//!
-//! Profiles are version-controlled alongside the codebase so that every batch
-//! is fully reproducible: the profile name and its full TOML content are
-//! snapshotted in the database at build time.
+//! Profile TOML loading and validation.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-/// Allowed values for `[[flags]].var`.  Using a whitelist so we don't
-/// accidentally inject arbitrary environment variables into builds.
+// Whitelist: profiles must not inject arbitrary env vars into builds.
 const ALLOWED_FLAG_VARS: &[&str] = &[
     "DEB_CFLAGS_APPEND",
     "DEB_CXXFLAGS_APPEND",
@@ -21,11 +12,6 @@ const ALLOWED_FLAG_VARS: &[&str] = &[
     "DEB_LDFLAGS_APPEND",
 ];
 
-// ---------------------------------------------------------------------------
-// Deserialization types
-// ---------------------------------------------------------------------------
-
-/// A build profile loaded from a TOML file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -34,11 +20,10 @@ pub struct Profile {
     #[serde(default)]
     pub flags: Vec<Flag>,
 
-    /// The profile name, derived from the filename (not part of the TOML).
+    /// From the filename, not the TOML.
     #[serde(skip)]
     pub name: String,
 
-    /// The raw TOML content, for snapshotting into the database.
     #[serde(skip)]
     pub raw_content: String,
 }
@@ -79,24 +64,15 @@ pub struct Target {
     pub series: String,
 }
 
-/// A single flag to inject into the build environment.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Flag {
-    /// The environment variable to append to (e.g. `DEB_CFLAGS_APPEND`).
     pub var: String,
-    /// The flag value (e.g. `-gdwarf-4`).
     pub flag: String,
-    /// Human-readable rationale for why this flag is needed.
     pub reason: String,
 }
 
-// ---------------------------------------------------------------------------
-// Loading and validation
-// ---------------------------------------------------------------------------
-
 impl Profile {
-    /// Load a profile from a TOML file, validate it, and return it.
     pub fn load(path: &Path) -> Result<Self> {
         let raw_content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read profile: {}", path.display()))?;
@@ -117,7 +93,6 @@ impl Profile {
         Ok(profile)
     }
 
-    /// Validate profile contents beyond what serde can check.
     fn validate(&self) -> Result<()> {
         if self.compiler.version.is_empty() {
             bail!("Profile {}: compiler.version must not be empty", self.name);
@@ -127,7 +102,6 @@ impl Profile {
             bail!("Profile {}: target.series must not be empty", self.name);
         }
 
-        // Validate flag variables are in the whitelist.
         for flag in &self.flags {
             if !ALLOWED_FLAG_VARS.contains(&flag.var.as_str()) {
                 bail!(
@@ -145,10 +119,7 @@ impl Profile {
         Ok(())
     }
 
-    /// Check that the target series is available for building.
-    ///
-    /// For `--chroot-mode=unshare`, sbuild uses debootstrap, so the series
-    /// must have a debootstrap script.
+    /// unshare mode debootstraps the series.
     pub fn validate_series_available(&self) -> Result<()> {
         let script_path = format!("/usr/share/debootstrap/scripts/{}", self.target.series);
         if !Path::new(&script_path).exists() {
@@ -162,10 +133,6 @@ impl Profile {
         Ok(())
     }
 
-    /// Collect profile flags grouped by environment variable name.
-    ///
-    /// Multiple flags targeting the same variable are concatenated with spaces.
-    /// Returns a list of `(var_name, combined_value)` pairs.
     pub fn build_env_vars(&self) -> Vec<(String, String)> {
         use std::collections::BTreeMap;
         let mut map: BTreeMap<String, Vec<&str>> = BTreeMap::new();
@@ -177,7 +144,6 @@ impl Profile {
             .collect()
     }
 
-    /// Generate a batch name from the profile name and current timestamp.
     pub fn batch_name(&self) -> String {
         format!(
             "{}-{}",

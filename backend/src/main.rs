@@ -1,4 +1,4 @@
-//! Ubuntu Archive Rebuilder — CLI entry point.
+//! CLI entry point.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,7 +13,7 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(
     name = "rebuilder",
-    about = "Ubuntu archive rebuilder — build packages with different compilers and analyse results",
+    about = "Build Ubuntu archive packages with different compilers and analyse results",
     version
 )]
 struct Cli {
@@ -21,7 +21,7 @@ struct Cli {
     #[arg(long, default_value = "rebuilder.db", env = "REBUILD_DB")]
     db: PathBuf,
 
-    /// Enable verbose output (includes full sbuild output on stdout).
+    /// Verbose output (full sbuild output on stdout).
     #[arg(short, long)]
     verbose: bool,
 
@@ -33,11 +33,11 @@ struct Cli {
 enum Commands {
     /// Build packages using a compiler profile.
     Build {
-        /// Path to a profile TOML file (e.g. profiles/clang-18-noble.toml).
+        /// Profile TOML file (e.g. profiles/clang-18-noble.toml).
         #[arg(long)]
         profile: PathBuf,
 
-        /// File containing package names to build (one per line).
+        /// Package list file, one name per line.
         #[arg(long)]
         packages: PathBuf,
 
@@ -49,48 +49,27 @@ enum Commands {
         #[arg(short, long)]
         jobs: Option<usize>,
 
-        /// Run package test suites (default: skip tests).
+        /// Run package test suites.
         #[arg(long, default_value = "false")]
         run_tests: bool,
 
-        /// Log storage policy:
-        ///   all      — compress and store every build log (default).
-        ///   failures — store only failed/timeout/dep_wait logs; succeeded logs
-        ///              are scanned for findings then discarded.
-        ///   none     — scan for findings then discard all logs.
+        /// Log storage policy: all, failures, or none.
         #[arg(long, default_value = "all")]
         store_logs: StoreLogs,
 
-        /// Base directory for downloaded source packages.
-        /// Defaults to /var/tmp/rebuild-source (real disk, not RAM tmpfs).
+        /// Base directory for source downloads (real disk, not tmpfs).
         #[arg(long, default_value = "/var/tmp/rebuild-source")]
         source_dir: PathBuf,
 
-        /// Target build architecture.  Passed to sbuild as `--arch=<arch>`
-        /// and recorded on the batch.  Defaults to the host arch (`amd64` on
-        /// typical x86_64 builders).  Must match an arch the target series
-        /// supports; for non-amd64/i386 arches the chroot will be fetched
-        /// from ports.ubuntu.com.
+        /// Target build architecture (non-amd64/i386 uses ports.ubuntu.com).
         #[arg(long, default_value = "amd64")]
         arch: String,
 
-        /// Per-build cgroup memory limit in MB.  When set, each sbuild
-        /// invocation is placed in a cgroup with this memory limit.  If a
-        /// build exceeds the limit, it is killed and marked as OOM-killed.
-        /// Default: 14336 (14 GB), tuned for a 15 GB host.
+        /// Per-build cgroup memory limit in MB; 0 disables.
         #[arg(long, default_value = "14336")]
         memory_limit_mb: u64,
 
-        /// sbuild chroot backend to use.
-        ///
-        ///   unshare — ephemeral chroots via user namespaces (default, no root
-        ///             needed, but fresh debootstrap/dep install per build).
-        ///   schroot — persistent schroot directory chroots (requires
-        ///             pre-created chroot via sbuild-createchroot, but build
-        ///             deps persist across builds and compilers can be
-        ///             pre-installed for much faster iteration).
-        ///
-        /// Can also be set via the REBUILD_CHROOT_MODE environment variable.
+        /// Chroot backend: unshare (ephemeral, default) or schroot (persistent).
         #[arg(long, default_value = "unshare", env = "REBUILD_CHROOT_MODE")]
         chroot_mode: ChrootMode,
     },
@@ -111,38 +90,25 @@ enum Commands {
 
     /// Export data for the report viewer.
     Export {
-        /// Output directory for the export (receives rebuild.db and logs/).
+        /// Output directory (receives rebuild.db and logs/).
         #[arg(long)]
         output_dir: PathBuf,
 
         /// Write log files only for this batch (by ID or name).
-        /// The exported database always contains all batches.
         #[arg(long)]
         batch: Option<String>,
     },
 
-    /// Re-derive findings for all builds by re-scanning their stored build logs.
-    ///
-    /// Deletes existing findings and regenerates them with the current analyzer
-    /// patterns. Useful after fixing or adding error/observation patterns.
+    /// Re-derive findings for all builds by re-scanning stored logs.
     Rescan {
         /// Re-scan every build in the database.
         #[arg(long)]
         all: bool,
     },
 
-    /// Fetch a list of source packages from the Ubuntu archive.
-    ///
-    /// Downloads and parses the Sources.gz index for the given series and
-    /// components, filters by target architecture, and writes a package list
-    /// file ready to pass to `rebuilder build --packages`.
-    ///
-    /// Example:
-    ///   rebuilder fetch-packages --series noble --output packages-noble.txt
-    ///   rebuilder fetch-packages --series noble --components main,universe \
-    ///       --arch arm64 --output packages-noble-arm64.txt
+    /// Fetch a source package list from the Ubuntu archive.
     FetchPackages {
-        /// Ubuntu series to fetch packages for (e.g. noble, jammy).
+        /// Ubuntu series (e.g. noble, jammy).
         #[arg(long)]
         series: String,
 
@@ -150,17 +116,11 @@ enum Commands {
         #[arg(long, default_value = "main", value_delimiter = ',')]
         components: Vec<String>,
 
-        /// Target build architecture.  Packages that cannot build on this
-        /// architecture are excluded.  Defaults to amd64.
-        ///
-        /// Also controls the default mirror: amd64 and i386 use
-        /// archive.ubuntu.com; all other architectures use
-        /// ports.ubuntu.com.  Override with --url if needed.
+        /// Target architecture (also selects the default mirror).
         #[arg(long, default_value = "amd64")]
         arch: String,
 
-        /// Override the archive mirror base URL.  Defaults to the standard
-        /// mirror for the chosen architecture.
+        /// Override the archive mirror base URL.
         #[arg(long)]
         url: Option<String>,
 
@@ -200,8 +160,6 @@ async fn main() -> Result<()> {
         } => {
             let profile = Profile::load(&profile_path)?;
 
-            // For unshare mode, the series must have a debootstrap script.
-            // For schroot mode, the chroot pre-exists — skip this check.
             if chroot_mode == ChrootMode::Unshare {
                 profile.validate_series_available()?;
             }
@@ -367,8 +325,6 @@ async fn main() -> Result<()> {
             let mut findings_after = 0u64;
 
             for build in &builds {
-                // Fetch the log separately — list_all_builds intentionally
-                // omits log content to avoid loading gigabytes into memory.
                 let Some(log) = db::get_build_log(&pool, build.id).await? else {
                     skipped += 1;
                     continue;
@@ -415,7 +371,6 @@ async fn main() -> Result<()> {
         } => {
             let mirror = url.unwrap_or_else(|| fetcher::default_mirror_for_arch(&arch).to_string());
 
-            // ureq is synchronous; run it off the async executor.
             let series2 = series.clone();
             let arch2 = arch.clone();
             let mirror2 = mirror.clone();
@@ -427,14 +382,12 @@ async fn main() -> Result<()> {
             .await
             .context("fetch task panicked")??;
 
-            // Build per-component counts for the summary.
             let mut comp_counts: std::collections::BTreeMap<&str, usize> =
                 std::collections::BTreeMap::new();
             for (_, comp) in &packages {
                 *comp_counts.entry(comp.as_str()).or_default() += 1;
             }
 
-            // Write output file with a comment header.
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
             let comp_str = components.join(", ");
             let mut lines = Vec::with_capacity(packages.len() + 8);
@@ -449,7 +402,7 @@ async fn main() -> Result<()> {
             for (pkg, comp) in &packages {
                 lines.push(format!("{pkg}\t{comp}"));
             }
-            lines.push(String::new()); // trailing newline
+            lines.push(String::new());
 
             std::fs::write(&output, lines.join("\n"))
                 .with_context(|| format!("Failed to write {}", output.display()))?;
@@ -465,18 +418,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Read package names from a file, one per line.  Blank lines and `#` comments
-/// are skipped.  Duplicate package names are dropped (first occurrence wins):
-/// a duplicate would otherwise violate the batch's
-/// `UNIQUE(batch_id, source_package, attempt_number)` constraint and abort
-/// the whole run.
-///
-/// Each non-comment line may be either a bare package name or a
-/// tab-delimited (or single-space-delimited) `package<TAB>component` pair
-/// — the latter form is what `fetch-packages` writes, so the component is
-/// preserved through to the per-build DB row.  A bare name yields `None`
-/// for the component, preserving backward compatibility with hand-written
-/// lists like `packages-smoke.txt`.
+/// Lines are `name` or `name<TAB>component` (the form fetch-packages writes).
+/// Duplicates are dropped: a second insert would violate the batch's UNIQUE
+/// constraint and abort the run.
 fn read_package_list(path: &Path) -> Result<Vec<(String, Option<String>)>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read package list: {}", path.display()))?;
@@ -489,9 +433,6 @@ fn read_package_list(path: &Path) -> Result<Vec<(String, Option<String>)>> {
             continue;
         }
 
-        // Split on the first tab, falling back to a single space for
-        // hand-edited lists.  Only the first whitespace run is considered:
-        // archive package names never contain spaces.
         let (name, comp) = line
             .split_once('\t')
             .or_else(|| line.split_once(' '))
@@ -514,14 +455,13 @@ fn read_package_list(path: &Path) -> Result<Vec<(String, Option<String>)>> {
         if seen.insert(name.to_string()) {
             list.push((name.to_string(), comp));
         } else {
-            warn!("Duplicate package '{name}' in list — keeping first occurrence");
+            warn!("Duplicate package '{name}' in list, keeping first occurrence");
         }
     }
 
     Ok(list)
 }
 
-/// Resolve a batch from an optional ID/name string, or fall back to the latest.
 async fn resolve_batch(
     pool: &sqlx::SqlitePool,
     id_or_name: Option<&str>,
@@ -588,7 +528,6 @@ mod tests {
 
     #[test]
     fn read_package_list_space_delimited_component() {
-        // Hand-edited lists may use a single space; the parser accepts it.
         let path = write_tmp("foo main\nbar universe\n");
         let list = read_package_list(&path).unwrap();
         assert_eq!(
@@ -602,7 +541,6 @@ mod tests {
 
     #[test]
     fn read_package_list_mixed_bare_and_component() {
-        // A list may mix bare names (legacy) with tab-delimited entries.
         let path = write_tmp("foo\nbar\tuniverse\nbaz\n");
         let list = read_package_list(&path).unwrap();
         assert_eq!(
@@ -631,9 +569,6 @@ mod tests {
 
     #[test]
     fn read_package_list_dedups_repeated_names() {
-        // Regression: a duplicate name would violate the batch's
-        // UNIQUE(batch_id, source_package, attempt_number) constraint and
-        // abort the entire run mid-batch.  First occurrence wins.
         let path = write_tmp("foo\tmain\nbar\nfoo\tuniverse\nfoo\nbaz\n");
         let list = read_package_list(&path).unwrap();
         assert_eq!(

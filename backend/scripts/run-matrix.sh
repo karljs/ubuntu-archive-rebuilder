@@ -1,8 +1,6 @@
 #!/bin/bash
 # Run rebuilder builds across any combination of profiles and package sets.
-#
-# Discovers profiles automatically from profiles/*.toml. Filters narrow the
-# set before execution. Use --dry-run to see what would run without building.
+# Discovers profiles from profiles/*.toml; filters narrow the set first.
 #
 # Usage:
 #   ./scripts/run-matrix.sh [OPTIONS]
@@ -16,22 +14,6 @@
 #   --jobs N           Parallel make jobs per build (default: CPU count)
 #   --no-export        Skip the frontend export step after all builds finish
 #   --dry-run          Print what would run without executing anything
-#
-# Examples:
-#   # Run every profile against the default package set
-#   ./scripts/run-matrix.sh
-#
-#   # Quick test: all noble profiles against a small package list
-#   ./scripts/run-matrix.sh --series noble --packages packages-smoke.txt
-#
-#   # Single profile
-#   ./scripts/run-matrix.sh --profile clang-21-resolute
-#
-#   # All Clang profiles, any series, medium package set
-#   ./scripts/run-matrix.sh --compiler clang --packages packages-medium.txt
-#
-#   # See what a full run would do without building
-#   ./scripts/run-matrix.sh --dry-run
 
 set -euo pipefail
 
@@ -51,10 +33,6 @@ DRY_RUN=0
 
 export REBUILD_DB="$PIPELINE_DIR/rebuilder.db"
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --packages)  PACKAGES="$2";          shift 2 ;;
@@ -72,10 +50,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ---------------------------------------------------------------------------
-# Pre-flight
-# ---------------------------------------------------------------------------
-
 if [[ "$DRY_RUN" -eq 0 && ! -f "$CARGO_BIN" ]]; then
     echo "Pipeline binary not found: $CARGO_BIN" >&2
     echo "Run: cd backend && cargo build --release" >&2
@@ -87,12 +61,8 @@ if [[ ! -f "$PACKAGES" ]]; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# Parse a TOML profile file — extract series and compiler type.
-# The TOML is simple enough that line-oriented grep/awk is sufficient.
-# Returns 1 if either field is missing (malformed profile).
-# ---------------------------------------------------------------------------
-
+# Extract series and compiler type from a profile TOML; the format is simple
+# enough for awk. Returns 1 for malformed profiles.
 parse_profile() {
     local toml="$1"
     local varname_series="$2"
@@ -109,12 +79,8 @@ parse_profile() {
     printf -v "$varname_compiler" '%s' "$_compiler"
 }
 
-# ---------------------------------------------------------------------------
-# Profile discovery and filtering
-# ---------------------------------------------------------------------------
-
-SELECTED_PROFILES=()   # array of profile stems that passed all filters
-SKIP_REASONS=()        # parallel array of skip reasons for dry-run
+SELECTED_PROFILES=()
+SKIP_REASONS=()
 
 discover_profiles() {
     local toml stem series compiler
@@ -124,25 +90,21 @@ discover_profiles() {
         [[ -f "$toml" ]] || continue
         stem="$(basename "$toml" .toml)"
 
-        # Parse TOML — skip malformed files.
         if ! parse_profile "$toml" series compiler; then
-            echo "WARNING: Could not parse $toml — skipping" >&2
+            echo "WARNING: Could not parse $toml, skipping" >&2
             continue
         fi
 
-        # Apply --series filter.
         if [[ -n "$FILTER_SERIES" && "$series" != "$FILTER_SERIES" ]]; then
             SKIP_REASONS+=("series $series != $FILTER_SERIES")
             continue
         fi
 
-        # Apply --compiler filter.
         if [[ -n "$FILTER_COMPILER" && "$compiler" != "$FILTER_COMPILER" ]]; then
             SKIP_REASONS+=("compiler $compiler != $FILTER_COMPILER")
             continue
         fi
 
-        # Apply --profile glob filters (union: any match wins).
         if [[ "${#FILTER_PROFILES[@]}" -gt 0 ]]; then
             matched_glob=0
             for pat in "${FILTER_PROFILES[@]}"; do
@@ -165,10 +127,6 @@ discover_profiles
 
 PKG_COUNT=$(grep -cv '^\(#\|[[:space:]]*$\)' "$PACKAGES" || true)
 
-# ---------------------------------------------------------------------------
-# Summary header
-# ---------------------------------------------------------------------------
-
 echo "=== Rebuild matrix ==="
 echo "Profiles:  $PROFILES_DIR"
 echo "Packages:  $PACKAGES ($PKG_COUNT packages)"
@@ -186,15 +144,13 @@ if [[ "${#SELECTED_PROFILES[@]}" -eq 0 ]]; then
     exit 1
 fi
 
-# Sort profiles for deterministic output: GCC first (baseline), then Clang;
-# within each type, alphabetically.
+# gcc profiles run first so the baseline exists before the comparisons.
 mapfile -t SELECTED_PROFILES < <(
     for stem in "${SELECTED_PROFILES[@]}"; do
         toml="$PROFILES_DIR/${stem}.toml"
         _discard_series=""
         compiler_sort=""
         parse_profile "$toml" _discard_series compiler_sort 2>/dev/null || compiler_sort="zzz"
-        # Put gcc before clang so baseline runs first.
         [[ "$compiler_sort" == "gcc" ]] && prefix="0" || prefix="1"
         echo "${prefix}${stem}"
     done | sort | sed 's/^.//'
@@ -209,18 +165,10 @@ for stem in "${SELECTED_PROFILES[@]}"; do
 done
 echo ""
 
-# ---------------------------------------------------------------------------
-# Dry-run exit
-# ---------------------------------------------------------------------------
-
 if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[DRY RUN] No builds were executed."
     exit 0
 fi
-
-# ---------------------------------------------------------------------------
-# Build loop
-# ---------------------------------------------------------------------------
 
 JOBS_ARG=()
 [[ -n "$JOBS" ]] && JOBS_ARG=(--jobs "$JOBS")
@@ -246,19 +194,11 @@ for stem in "${SELECTED_PROFILES[@]}"; do
     fi
 done
 
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
-
 if [[ "$DO_EXPORT" -eq 1 ]]; then
     echo "--- Exporting to frontend ---"
     "$CARGO_BIN" export --output-dir "$FRONTEND_DIR/data"
     echo ""
 fi
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 
 echo "=== Done ==="
 "$CARGO_BIN" list

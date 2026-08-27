@@ -1,26 +1,16 @@
 #!/bin/bash
-# Installs the target Clang version inside the sbuild chroot.
-#
-# Runs as --chroot-setup-commands (BEFORE build-dependency installation).
-# Only installs clang here; wrapper setup is deferred to starting_build.sh
-# which runs AFTER deps are installed so it can reliably intercept gcc.
-#
-# Placeholder __CLANG_VERSION__ is replaced at runtime by the pipeline.
+# Installs the target Clang version in the sbuild chroot, as
+# --chroot-setup-commands (before build-deps). __CLANG_VERSION__ is
+# substituted at runtime.
 set -e
 
-# Prevent dpkg-preconfigure/debconf from trying to open /dev/tty.  The
-# pipeline puts sbuild in its own process group (for killpg), which makes it
-# a background group on the terminal.  A background read on /dev/tty triggers
-# SIGTTIN and stops the entire install.
+# The pipeline's setpgid makes us a background group; a /dev/tty read
+# would SIGTTIN and stop the install.
 export DEBIAN_FRONTEND=noninteractive
 
-# Inject an HTTP(S) proxy into apt's configuration if the pipeline supplied
-# one via REBUILD_HTTP_PROXY.  sbuild's unshare chroot does not inherit the
-# outer shell's http_proxy / https_proxy env vars, so without this apt-get
-# update / install inside the chroot cannot reach the archive on hosts that
-# require a proxy.  An empty value leaves apt's default config untouched.
-# SC2157: __HTTP_PROXY__ is a placeholder substituted by the Rust pipeline
-# before this script reaches the shell; shellcheck sees the literal instead.
+# The unshare chroot doesn't inherit proxy env vars; REBUILD_HTTP_PROXY
+# forwards one into apt's config. SC2157: placeholder, substituted before
+# the shell sees it.
 # shellcheck disable=SC2157
 if [ -n "__HTTP_PROXY__" ]; then
     echo "Acquire::http::Proxy  \"__HTTP_PROXY__\";"  >  /etc/apt/apt.conf.d/99proxy

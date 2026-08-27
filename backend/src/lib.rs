@@ -1,8 +1,4 @@
-//! Rebuild Experiments Pipeline
-//!
-//! A tool for building Ubuntu archive packages with different compilers
-//! (Clang or GCC) and analyzing the results.  Compiler configuration is
-//! managed through versioned TOML profile files.
+//! Build Ubuntu archive packages with different compilers, analyze the logs.
 
 pub mod analyzer;
 pub mod builder;
