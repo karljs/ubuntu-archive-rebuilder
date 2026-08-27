@@ -33,9 +33,9 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 
+use crate::analyzer::infer_status;
 use crate::builder::cgroup::SystemdScopeCgroup;
 use crate::builder::time_parser::parse_time_output;
-use crate::analyzer::infer_status;
 use crate::models::BuildStatus;
 use crate::profile::CompilerType;
 use uuid::Uuid;
@@ -68,7 +68,9 @@ impl std::str::FromStr for ChrootMode {
         match s {
             "unshare" => Ok(Self::Unshare),
             "schroot" => Ok(Self::Schroot),
-            other => Err(format!("unknown chroot mode: {other} (expected: unshare, schroot)")),
+            other => Err(format!(
+                "unknown chroot mode: {other} (expected: unshare, schroot)"
+            )),
         }
     }
 }
@@ -203,15 +205,30 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         Ok(Err(e)) => {
             info!("Killing process group (pgid={pgid}) due to: {e}");
             kill_process_group(pgid).await;
-            drain_pipes(&mut stdout_lines, &mut stderr_lines, &mut log_lines, &mut time_output).await;
+            drain_pipes(
+                &mut stdout_lines,
+                &mut stderr_lines,
+                &mut log_lines,
+                &mut time_output,
+            )
+            .await;
             let _ = child.wait().await;
             return Err(e);
         }
         Err(_elapsed) => {
             timed_out = true;
-            info!("Build timed out after {}s, killing process group (pgid={pgid})", config.timeout_seconds);
+            info!(
+                "Build timed out after {}s, killing process group (pgid={pgid})",
+                config.timeout_seconds
+            );
             kill_process_group(pgid).await;
-            drain_pipes(&mut stdout_lines, &mut stderr_lines, &mut log_lines, &mut time_output).await;
+            drain_pipes(
+                &mut stdout_lines,
+                &mut stderr_lines,
+                &mut log_lines,
+                &mut time_output,
+            )
+            .await;
         }
     }
 
@@ -219,15 +236,16 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     // closed (sbuild exited) but systemd-run is still alive collecting the
     // exit code, so the scope's cgroup still exists.  After child.wait()
     // returns, systemd-run exits and systemd cleans up the scope.
-    let scope_cgroup = scope_name.as_deref().and_then(|name| {
-        match SystemdScopeCgroup::from_scope_name(name) {
-            Ok(cg) => Some(cg),
-            Err(e) => {
-                debug!("Could not access scope cgroup for OOM detection: {e}");
-                None
-            }
-        }
-    });
+    let scope_cgroup =
+        scope_name
+            .as_deref()
+            .and_then(|name| match SystemdScopeCgroup::from_scope_name(name) {
+                Ok(cg) => Some(cg),
+                Err(e) => {
+                    debug!("Could not access scope cgroup for OOM detection: {e}");
+                    None
+                }
+            });
 
     let exit_status = child.wait().await.context("Failed to wait for sbuild")?;
     let log = log_lines.join("\n");
@@ -247,7 +265,11 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     let (final_status, final_memory_limit_mb) = if let Some(cg) = scope_cgroup {
         let oom_killed = cg.read_oom_kill().unwrap_or(false);
         let limit = Some(config.memory_limit_mb);
-        let status = if oom_killed { BuildStatus::OomKilled } else { status };
+        let status = if oom_killed {
+            BuildStatus::OomKilled
+        } else {
+            status
+        };
         (status, limit)
     } else if scope_name.is_some() {
         // We used systemd-run but couldn't read the scope cgroup (race lost).
@@ -352,18 +374,14 @@ fn build_command(
             let starting_cmd = wrap_in_heredoc(
                 "clang-wrapper-setup.sh",
                 "CLANG_WRAPPER_EOF",
-                &STARTING_BUILD_SCRIPT
-                    .replace("__CLANG_VERSION__", &config.compiler_version),
+                &STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", &config.compiler_version),
             );
             sbuild_args.push(format!("--chroot-setup-commands={setup_cmd}"));
             sbuild_args.push(format!("--starting-build-commands={starting_cmd}"));
         }
         CompilerType::Gcc => {
-            let starting_cmd = wrap_in_heredoc(
-                "gcc-verify.sh",
-                "GCC_VERIFY_EOF",
-                GCC_VERIFY_SCRIPT,
-            );
+            let starting_cmd =
+                wrap_in_heredoc("gcc-verify.sh", "GCC_VERIFY_EOF", GCC_VERIFY_SCRIPT);
             sbuild_args.push(format!("--starting-build-commands={starting_cmd}"));
         }
     }
@@ -461,9 +479,9 @@ fn generate_sbuild_config(
 
     // Build the Perl hash entries for $build_environment. Each entry is a
     // bare key-value pair; the template provides the surrounding indentation.
-    let mut env_entries = vec![
-        format!("'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',"),
-    ];
+    let mut env_entries = vec![format!(
+        "'DEB_BUILD_OPTIONS' => 'parallel={jobs}{nocheck}',"
+    )];
     for (var, value) in build_env {
         // Perl single-quote escaping: ' becomes '\''
         let escaped = value.replace('\'', "'\\''");
@@ -610,10 +628,7 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
         let trimmed = line.trim();
 
         // Skip lines that are part of the echoed script source
-        if trimmed.starts_with("echo ")
-            || trimmed.starts_with('"')
-            || trimmed.starts_with('\'')
-        {
+        if trimmed.starts_with("echo ") || trimmed.starts_with('"') || trimmed.starts_with('\'') {
             continue;
         }
 
@@ -661,7 +676,9 @@ fn detect_compiler_from_log(log: &str, compiler_type: CompilerType) -> String {
         return match compiler_type {
             CompilerType::Clang => "ERROR: gcc wrapper setup FAILED - built with real GCC".into(),
             // e.g. a leftover clang wrapper in a persistent schroot chroot.
-            CompilerType::Gcc => "ERROR: gcc verification FAILED - gcc --version did not report gcc".into(),
+            CompilerType::Gcc => {
+                "ERROR: gcc verification FAILED - gcc --version did not report gcc".into()
+            }
         };
     }
 
@@ -728,8 +745,7 @@ mod tests {
 
     #[test]
     fn starting_build_substitutes_version() {
-        let script = STARTING_BUILD_SCRIPT
-            .replace("__CLANG_VERSION__", "19");
+        let script = STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", "19");
         assert!(script.contains(r#"CLANG_VERSION="19""#));
         assert!(!script.contains("__CLANG_VERSION__"));
     }
@@ -760,8 +776,7 @@ mod tests {
 
     #[test]
     fn starting_build_no_placeholders_remain() {
-        let script = STARTING_BUILD_SCRIPT
-            .replace("__CLANG_VERSION__", "18");
+        let script = STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", "18");
         assert!(!script.contains("__CLANG_VERSION__"));
     }
 
@@ -789,7 +804,10 @@ mod tests {
         let log = "REBUILD:   gcc --version: Ubuntu clang version 18.1.3\n\
                    REBUILD-ERROR: FAILED - gcc is not reporting as gcc: Ubuntu clang version 18.1.3\n";
         let result = detect_compiler_from_log(log, CompilerType::Gcc);
-        assert!(result.contains("ERROR: gcc verification FAILED"), "got: {result}");
+        assert!(
+            result.contains("ERROR: gcc verification FAILED"),
+            "got: {result}"
+        );
         assert!(!result.contains("chroot setup failed"), "got: {result}");
     }
 
@@ -797,7 +815,10 @@ mod tests {
     fn detects_gcc_missing_from_chroot() {
         let log = "REBUILD-ERROR: FAILED - gcc not found in chroot\n";
         let result = detect_compiler_from_log(log, CompilerType::Gcc);
-        assert!(result.contains("ERROR: gcc verification FAILED"), "got: {result}");
+        assert!(
+            result.contains("ERROR: gcc verification FAILED"),
+            "got: {result}"
+        );
     }
 
     #[test]
@@ -815,9 +836,21 @@ mod tests {
         let mut log_lines = Vec::new();
         let mut time_output = String::new();
 
-        classify_stderr_line("make[2]: *** [Makefile:79: all] Error 2".into(), &mut log_lines, &mut time_output);
-        classify_stderr_line("\tMaximum resident set size (kbytes): 2048".into(), &mut log_lines, &mut time_output);
-        classify_stderr_line("\tExit status: 137".into(), &mut log_lines, &mut time_output);
+        classify_stderr_line(
+            "make[2]: *** [Makefile:79: all] Error 2".into(),
+            &mut log_lines,
+            &mut time_output,
+        );
+        classify_stderr_line(
+            "\tMaximum resident set size (kbytes): 2048".into(),
+            &mut log_lines,
+            &mut time_output,
+        );
+        classify_stderr_line(
+            "\tExit status: 137".into(),
+            &mut log_lines,
+            &mut time_output,
+        );
 
         assert_eq!(log_lines, vec!["make[2]: *** [Makefile:79: all] Error 2"]);
         assert!(time_output.contains("Maximum resident set size (kbytes): 2048"));
@@ -853,7 +886,10 @@ mod tests {
 
     #[test]
     fn detects_missing_markers() {
-        assert!(detect_compiler_from_log("some build output\n", CompilerType::Clang).contains("UNKNOWN"));
+        assert!(
+            detect_compiler_from_log("some build output\n", CompilerType::Clang)
+                .contains("UNKNOWN")
+        );
     }
 
     #[test]
@@ -886,8 +922,14 @@ mod tests {
         let log = "=== REBUILD: Installing Clang 18 ===\n\
                    REBUILD-ERROR: Failed to install clang-18 (check proxy / archive reachability)\n";
         let result = detect_compiler_from_log(log, CompilerType::Clang);
-        assert!(result.starts_with("ERROR: chroot setup failed"), "got: {result}");
-        assert!(result.contains("Failed to install clang-18"), "got: {result}");
+        assert!(
+            result.starts_with("ERROR: chroot setup failed"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("Failed to install clang-18"),
+            "got: {result}"
+        );
     }
 
     #[test]
@@ -978,8 +1020,14 @@ mod tests {
         for mode in [ChrootMode::Unshare, ChrootMode::Schroot] {
             let file = generate_sbuild_config(4, true, &[], mode).unwrap();
             let config = std::fs::read_to_string(file.path()).unwrap();
-            assert!(!config.contains("__ENV_BLOCK__"), "mode {mode:?}: __ENV_BLOCK__ remains");
-            assert!(!config.contains("__PURGE_BUILD_DEPS__"), "mode {mode:?}: __PURGE_BUILD_DEPS__ remains");
+            assert!(
+                !config.contains("__ENV_BLOCK__"),
+                "mode {mode:?}: __ENV_BLOCK__ remains"
+            );
+            assert!(
+                !config.contains("__PURGE_BUILD_DEPS__"),
+                "mode {mode:?}: __PURGE_BUILD_DEPS__ remains"
+            );
         }
     }
 }

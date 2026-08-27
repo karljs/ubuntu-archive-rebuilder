@@ -43,20 +43,6 @@ assert_not_in_log() {
     fi
 }
 
-assert_log_line_after() {
-    # Checks that the line AFTER the line matching $marker contains $expected.
-    local description="$1"
-    local marker="$2"
-    local expected="$3"
-    local found
-    found=$(grep -A1 -F "$marker" "$LOG_FILE" | tail -1)
-    if echo "$found" | grep -qF "$expected"; then
-        pass "$description"
-    else
-        fail "$description (after '$marker', expected '$expected', got: '$found')"
-    fi
-}
-
 FAILURES=0
 
 # ---------------------------------------------------------------------------

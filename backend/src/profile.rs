@@ -193,10 +193,7 @@ mod tests {
     use std::io::Write;
 
     fn write_profile(content: &str) -> tempfile::NamedTempFile {
-        let mut f = tempfile::Builder::new()
-            .suffix(".toml")
-            .tempfile()
-            .unwrap();
+        let mut f = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
     }
@@ -310,7 +307,10 @@ mod tests {
         let p = Profile::load(f.path()).unwrap();
         let env = p.build_env_vars();
         assert_eq!(env.len(), 2);
-        assert_eq!(env[0], ("DEB_CFLAGS_APPEND".to_string(), "-gdwarf-4".to_string()));
+        assert_eq!(
+            env[0],
+            ("DEB_CFLAGS_APPEND".to_string(), "-gdwarf-4".to_string())
+        );
     }
 
     #[test]

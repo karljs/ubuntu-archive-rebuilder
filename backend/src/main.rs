@@ -2,7 +2,9 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rebuilder::{builder, builder::ChrootMode, db, export, fetcher, models::StoreLogs, profile::Profile};
+use rebuilder::{
+    builder, builder::ChrootMode, db, export, fetcher, models::StoreLogs, profile::Profile,
+};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -246,8 +248,16 @@ async fn main() -> Result<()> {
             println!();
             println!("Batch completed: {batch_id}");
             println!("  Total: {}", stats.total);
-            println!("  Succeeded: {} ({:.1}%)", stats.succeeded, stats.percent(stats.succeeded));
-            println!("  Failed: {} ({:.1}%)", stats.failed, stats.percent(stats.failed));
+            println!(
+                "  Succeeded: {} ({:.1}%)",
+                stats.succeeded,
+                stats.percent(stats.succeeded)
+            );
+            println!(
+                "  Failed: {} ({:.1}%)",
+                stats.failed,
+                stats.percent(stats.failed)
+            );
             println!("  Dep-wait: {}", stats.dep_wait);
             println!("  Timeout: {}", stats.timeout);
             println!("  Oom-killed: {}", stats.oom_killed);
@@ -258,7 +268,10 @@ async fn main() -> Result<()> {
             if batches.is_empty() {
                 println!("No batches found.");
             } else {
-                println!("{:<20}  {:<8}  {:<8}  {:<10}  {:<20}", "STARTED", "COMPILER", "VERSION", "SERIES", "NAME");
+                println!(
+                    "{:<20}  {:<8}  {:<8}  {:<10}  {:<20}",
+                    "STARTED", "COMPILER", "VERSION", "SERIES", "NAME"
+                );
                 println!("{}", "-".repeat(75));
                 for b in batches {
                     println!(
@@ -280,7 +293,10 @@ async fn main() -> Result<()> {
 
             println!("Batch: {}", batch.name);
             println!("  ID: {}", batch.id);
-            println!("  Compiler: {} {}", batch.compiler_type, batch.compiler_version);
+            println!(
+                "  Compiler: {} {}",
+                batch.compiler_type, batch.compiler_version
+            );
             println!("  Series: {}", batch.series);
             println!("  Profile: {}", batch.profile_name);
             println!("  Backend: {}", batch.builder_backend);
@@ -292,8 +308,16 @@ async fn main() -> Result<()> {
             println!();
             println!("Build Status:");
             println!("  Total: {}", stats.total);
-            println!("  Succeeded: {} ({:.1}%)", stats.succeeded, stats.percent(stats.succeeded));
-            println!("  Failed: {} ({:.1}%)", stats.failed, stats.percent(stats.failed));
+            println!(
+                "  Succeeded: {} ({:.1}%)",
+                stats.succeeded,
+                stats.percent(stats.succeeded)
+            );
+            println!(
+                "  Failed: {} ({:.1}%)",
+                stats.failed,
+                stats.percent(stats.failed)
+            );
             if stats.environmental > 0 {
                 println!("  Environmental (excluded): {}", stats.environmental);
             }
@@ -389,9 +413,7 @@ async fn main() -> Result<()> {
             url,
             output,
         } => {
-            let mirror = url.unwrap_or_else(|| {
-                fetcher::default_mirror_for_arch(&arch).to_string()
-            });
+            let mirror = url.unwrap_or_else(|| fetcher::default_mirror_for_arch(&arch).to_string());
 
             // ureq is synchronous; run it off the async executor.
             let series2 = series.clone();
@@ -416,7 +438,7 @@ async fn main() -> Result<()> {
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
             let comp_str = components.join(", ");
             let mut lines = Vec::with_capacity(packages.len() + 8);
-            lines.push(format!("# Ubuntu source package list"));
+            lines.push("# Ubuntu source package list".to_string());
             lines.push(format!("# Series:     {series}"));
             lines.push(format!("# Components: {comp_str}"));
             lines.push(format!("# Arch:       {arch}"));
@@ -483,7 +505,11 @@ fn read_package_list(path: &Path) -> Result<Vec<(String, Option<String>)>> {
                 }
             })
             .unwrap_or((line, ""));
-        let comp = if comp.is_empty() { None } else { Some(comp.to_string()) };
+        let comp = if comp.is_empty() {
+            None
+        } else {
+            Some(comp.to_string())
+        };
 
         if seen.insert(name.to_string()) {
             list.push((name.to_string(), comp));
@@ -509,9 +535,7 @@ async fn resolve_batch(
 
     if let Some(s) = id_or_name {
         if let Ok(uuid) = Uuid::parse_str(s) {
-            db::get_batch(pool, uuid)
-                .await?
-                .context("Batch not found")
+            db::get_batch(pool, uuid).await?.context("Batch not found")
         } else {
             db::get_batch_by_name(pool, s)
                 .await?

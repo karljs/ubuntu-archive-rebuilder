@@ -50,9 +50,7 @@ pub async fn fetch_source(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "pull-lp-source failed for {package_name} in {series}: {stderr}\n{stdout}"
-        );
+        bail!("pull-lp-source failed for {package_name} in {series}: {stderr}\n{stdout}");
     }
 
     let dsc_path = find_dsc_file(work_dir, package_name)?;

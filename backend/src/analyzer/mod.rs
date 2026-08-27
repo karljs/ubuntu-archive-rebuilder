@@ -134,10 +134,10 @@ fn scan(log: &str, patterns: &[&ErrorPattern], severity: FindingSeverity) -> Vec
             let overflow = count - MAX_FINDINGS_PER_CATEGORY;
             // Find the pattern to get the base description and class.
             let pattern = patterns.iter().find(|p| p.key == category.as_str());
-            let base_desc = pattern.map(|p| p.description).unwrap_or("additional occurrences");
-            let class = pattern
-                .map(|p| p.class)
-                .unwrap_or(FindingClass::Toolchain);
+            let base_desc = pattern
+                .map(|p| p.description)
+                .unwrap_or("additional occurrences");
+            let class = pattern.map(|p| p.class).unwrap_or(FindingClass::Toolchain);
             findings.push(Finding {
                 category: category.clone(),
                 description: format!(
@@ -181,7 +181,7 @@ fn scan(log: &str, patterns: &[&ErrorPattern], severity: FindingSeverity) -> Vec
 /// Strategy: look for quoted tokens, backtick-quoted identifiers, or the
 /// word after a known keyword like "to", "for", "identifier".  Falls back
 /// to an empty string (category-level dedup) if nothing useful is found.
-fn extract_key<'a>(line: &'a str, pattern: &ErrorPattern) -> String {
+fn extract_key(line: &str, pattern: &ErrorPattern) -> String {
     // Try backtick-quoted identifiers: `symbol'  or `symbol`
     if let Some(start) = line.find('`') {
         let rest = &line[start + 1..];
@@ -211,7 +211,9 @@ fn extract_key<'a>(line: &'a str, pattern: &ErrorPattern) -> String {
     if pattern.key == "LINK_MISSING_LIBRARY" {
         if let Some(pos) = line.find("-l") {
             let rest = &line[pos + 2..];
-            let end = rest.find(|c: char| c.is_whitespace() || c == '\'').unwrap_or(rest.len().min(60));
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '\'')
+                .unwrap_or(rest.len().min(60));
             let candidate = &rest[..end];
             if !candidate.is_empty() {
                 return candidate.to_string();
@@ -268,7 +270,7 @@ pub fn infer_status(log: &str, exit_code: Option<i32>) -> BuildStatus {
 
     if strong_success {
         // Non-zero exit overrides even a strong marker (partial log guard).
-        return if exit_code.map_or(true, |c| c == 0) {
+        return if exit_code.is_none_or(|c| c == 0) {
             BuildStatus::Succeeded
         } else {
             BuildStatus::Failed
@@ -324,7 +326,9 @@ mod tests {
                    Build finished successfully";
         let findings = scan_log(log, BuildStatus::Succeeded);
         assert!(
-            findings.iter().all(|f| f.category != "LTO_FAT_OBJECTS_IGNORED"),
+            findings
+                .iter()
+                .all(|f| f.category != "LTO_FAT_OBJECTS_IGNORED"),
             "command-line occurrences of -ffat-lto-objects must not produce findings"
         );
     }
@@ -335,7 +339,10 @@ mod tests {
         let log = "install: cannot create directory '/build/x/usr/lib/udev/rules.d'\n\
                    make[3]: *** [Makefile:63: 55-dm_install] Error 1";
         let findings = scan_log(log, BuildStatus::Failed);
-        let race = findings.iter().find(|f| f.category == "PARALLEL_INSTALL_RACE").unwrap();
+        let race = findings
+            .iter()
+            .find(|f| f.category == "PARALLEL_INSTALL_RACE")
+            .unwrap();
         assert_eq!(race.class, FindingClass::Environmental);
     }
 
@@ -344,7 +351,10 @@ mod tests {
         use crate::models::FindingClass;
         let log = "bogl-font.c:84:3: error: function definition is not allowed here";
         let findings = scan_log(log, BuildStatus::Failed);
-        let f = findings.iter().find(|f| f.category == "GNU_NESTED_FUNCTIONS").unwrap();
+        let f = findings
+            .iter()
+            .find(|f| f.category == "GNU_NESTED_FUNCTIONS")
+            .unwrap();
         assert_eq!(f.class, FindingClass::Toolchain);
     }
 
@@ -369,8 +379,12 @@ mod tests {
         let log = "clang: warning: optimization flag '-ffat-lto-objects' is not supported [-Wignored-optimization-argument]\n\
                    bogl-font.c:84:3: error: function definition is not allowed here";
         let findings = scan_log(log, BuildStatus::Failed);
-        assert!(findings.iter().all(|f| f.category != "LTO_FAT_OBJECTS_IGNORED"));
-        assert!(findings.iter().any(|f| f.category == "GNU_NESTED_FUNCTIONS"));
+        assert!(findings
+            .iter()
+            .all(|f| f.category != "LTO_FAT_OBJECTS_IGNORED"));
+        assert!(findings
+            .iter()
+            .any(|f| f.category == "GNU_NESTED_FUNCTIONS"));
     }
 
     #[test]
@@ -379,7 +393,8 @@ mod tests {
                    /usr/bin/ld: undefined reference to `bar'\n\
                    /usr/bin/ld: undefined reference to `baz'";
         let findings = scan_log(log, BuildStatus::Failed);
-        let link_findings: Vec<_> = findings.iter()
+        let link_findings: Vec<_> = findings
+            .iter()
             .filter(|f| f.category == "LINK_MISSING_SYMBOL")
             .collect();
         // All three symbols are distinct, should each produce a finding.
@@ -425,7 +440,9 @@ mod tests {
                    make[3]: *** [Makefile:63: 55-dm_install] Error 1";
         let findings = scan_log(log, BuildStatus::Failed);
         assert!(
-            findings.iter().any(|f| f.category == "PARALLEL_INSTALL_RACE"),
+            findings
+                .iter()
+                .any(|f| f.category == "PARALLEL_INSTALL_RACE"),
             "install-directory race must be categorised"
         );
     }
@@ -440,19 +457,28 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let findings = scan_log(&log, BuildStatus::Failed);
-        let link_findings: Vec<_> = findings.iter()
+        let link_findings: Vec<_> = findings
+            .iter()
             .filter(|f| f.category == "LINK_MISSING_SYMBOL")
             .collect();
         // 5 normal + 1 summary = 6
         assert_eq!(link_findings.len(), 6);
-        assert!(link_findings.last().unwrap().description.contains("additional occurrence"));
+        assert!(link_findings
+            .last()
+            .unwrap()
+            .description
+            .contains("additional occurrence"));
     }
 
     #[test]
     fn pure_warning_line_skipped_in_error_scan() {
-        let log = "barcode.c:42:5: warning: format string is not a string literal [-Wformat-security]";
+        let log =
+            "barcode.c:42:5: warning: format string is not a string literal [-Wformat-security]";
         let findings = scan_log(log, BuildStatus::Failed);
-        assert!(findings.is_empty(), "pure warning lines must not produce error findings");
+        assert!(
+            findings.is_empty(),
+            "pure warning lines must not produce error findings"
+        );
     }
 
     #[test]
@@ -464,23 +490,38 @@ mod tests {
 
     #[test]
     fn infer_status_depwait() {
-        assert_eq!(infer_status("unsatisfiable build-dependencies", None), BuildStatus::DepWait);
+        assert_eq!(
+            infer_status("unsatisfiable build-dependencies", None),
+            BuildStatus::DepWait
+        );
     }
 
     #[test]
     fn infer_status_timeout() {
-        assert_eq!(infer_status("Build killed with signal TERM", None), BuildStatus::Timeout);
+        assert_eq!(
+            infer_status("Build killed with signal TERM", None),
+            BuildStatus::Timeout
+        );
     }
 
     #[test]
     fn infer_status_success() {
-        assert_eq!(infer_status("Build finished successfully", Some(0)), BuildStatus::Succeeded);
-        assert_eq!(infer_status("Build finished successfully", None), BuildStatus::Succeeded);
+        assert_eq!(
+            infer_status("Build finished successfully", Some(0)),
+            BuildStatus::Succeeded
+        );
+        assert_eq!(
+            infer_status("Build finished successfully", None),
+            BuildStatus::Succeeded
+        );
     }
 
     #[test]
     fn infer_status_nonzero_exit_suppresses_success() {
-        assert_eq!(infer_status("Build finished successfully", Some(1)), BuildStatus::Failed);
+        assert_eq!(
+            infer_status("Build finished successfully", Some(1)),
+            BuildStatus::Failed
+        );
     }
 
     #[test]

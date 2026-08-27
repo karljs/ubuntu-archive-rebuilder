@@ -169,7 +169,6 @@ const UNDECLARED_IDENTIFIER: ErrorPattern = ErrorPattern {
     class: crate::models::FindingClass::Toolchain,
 };
 
-
 /// Use of an undeclared GCC builtin.
 /// Separate from UNDECLARED_IDENTIFIER because the fix is different
 /// (add -fno-builtin or provide a declaration) and the pattern is specific.
@@ -325,11 +324,9 @@ const INCOMPATIBLE_FUNCTION_POINTER: ErrorPattern = ErrorPattern {
 /// issue.  Observed: lshw (partitions.cc) across every Clang version/series.
 const CXX17_REGISTER_REMOVED: ErrorPattern = ErrorPattern {
     key: "CXX17_REGISTER_REMOVED",
-    description: "Use of 'register' storage class specifier, removed in C++17 (Clang errors; GCC warns)",
-    patterns: &[
-        "'register' storage class specifier",
-        "-Wregister",
-    ],
+    description:
+        "Use of 'register' storage class specifier, removed in C++17 (Clang errors; GCC warns)",
+    patterns: &["'register' storage class specifier", "-Wregister"],
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
@@ -342,7 +339,8 @@ const CXX17_REGISTER_REMOVED: ErrorPattern = ErrorPattern {
 /// accepted.  Observed: coreutils (lib/posixtm.c).
 const CXX_CHECKED_INT_TYPE: ErrorPattern = ErrorPattern {
     key: "CXX_CHECKED_INT_TYPE",
-    description: "Checked integer builtin requires a proper integer type (Clang is stricter than GCC)",
+    description:
+        "Checked integer builtin requires a proper integer type (Clang is stricter than GCC)",
     patterns: &["checked integer operation must be an integer type"],
     require_prefix: None,
     exclude_if_contains: &[],
@@ -475,7 +473,8 @@ const LINK_FAILURE: ErrorPattern = ErrorPattern {
 ///      dwz 0.15/0.16 cannot process Clang's DWARF5 .debug_addr section.
 const LTO_DWARF_MISMATCH: ErrorPattern = ErrorPattern {
     key: "LTO_DWARF_MISMATCH",
-    description: "DWARF5 format incompatibility; dwz cannot process Clang output — use -gdwarf-4 profile",
+    description:
+        "DWARF5 format incompatibility; dwz cannot process Clang output — use -gdwarf-4 profile",
     patterns: &[
         "DWARF error: invalid or unhandled FORM value",
         "DWARF error: can't find",
@@ -597,12 +596,13 @@ const WERROR_FORMAT_STRING: ErrorPattern = ErrorPattern {
 const WERROR_UNUSED: ErrorPattern = ErrorPattern {
     key: "WERROR_UNUSED",
     description: "Unused variable/parameter/function warning promoted to error via -Werror",
-    patterns: &[
-        "-Werror,-Wunused",
-        "error: unused",
-    ],
+    patterns: &["-Werror,-Wunused", "error: unused"],
     require_prefix: None,
-    exclude_if_contains: &["checking whether", "supports compile flag", "compiler handles"],
+    exclude_if_contains: &[
+        "checking whether",
+        "supports compile flag",
+        "compiler handles",
+    ],
     dedup_by_extracted_key: false,
     suppressed_by: &[],
     class: crate::models::FindingClass::Toolchain,
@@ -788,7 +788,8 @@ const BUILD_TIMEOUT: ErrorPattern = ErrorPattern {
 /// command failed with exit code 139 — a SIGSEGV).
 const SEGFAULT_IN_COMPILER: ErrorPattern = ErrorPattern {
     key: "SEGFAULT_IN_COMPILER",
-    description: "Compiler process crashed (segmentation fault or frontend crash — likely a Clang bug)",
+    description:
+        "Compiler process crashed (segmentation fault or frontend crash — likely a Clang bug)",
     patterns: &[
         "Segmentation fault (core dumped)",
         "LLVM ERROR: ",
@@ -807,7 +808,11 @@ const SEGFAULT_IN_COMPILER: ErrorPattern = ErrorPattern {
 const OUT_OF_MEMORY: ErrorPattern = ErrorPattern {
     key: "OUT_OF_MEMORY",
     description: "Build process ran out of memory",
-    patterns: &["Cannot allocate memory", "out of memory", "memory exhausted"],
+    patterns: &[
+        "Cannot allocate memory",
+        "out of memory",
+        "memory exhausted",
+    ],
     require_prefix: None,
     exclude_if_contains: &[],
     dedup_by_extracted_key: false,
@@ -870,7 +875,7 @@ pub static ERROR_PATTERNS: &[&ErrorPattern] = &[
     &GNU_ASM_SYNTAX,
     // Implicit declarations
     &IMPLICIT_FUNCTION_DECLARATION,
-    &MISSING_BUILTIN,          // before UNDECLARED_IDENTIFIER (more specific)
+    &MISSING_BUILTIN, // before UNDECLARED_IDENTIFIER (more specific)
     &UNDECLARED_IDENTIFIER,
     // C++ type strictness
     &CXX11_NARROWING,
@@ -888,7 +893,7 @@ pub static ERROR_PATTERNS: &[&ErrorPattern] = &[
     &LINK_MISSING_SYMBOL,
     &LINK_MULTIPLE_DEFINITION,
     &LINK_MISSING_LIBRARY,
-    &LINK_FAILURE,             // catch-all, last among linker patterns
+    &LINK_FAILURE, // catch-all, last among linker patterns
     // LTO argument unsupported by this Clang (before generic flag pattern)
     &UNSUPPORTED_LTO_AUTO,
     // Compiler flags
@@ -938,7 +943,8 @@ pub static ERROR_PATTERNS: &[&ErrorPattern] = &[
 /// including GCC builds, which fully support the flag and never ignore it.
 const LTO_FAT_OBJECTS_IGNORED: ErrorPattern = ErrorPattern {
     key: "LTO_FAT_OBJECTS_IGNORED",
-    description: "Ubuntu's -ffat-lto-objects flag is silently ignored by Clang (different LTO model)",
+    description:
+        "Ubuntu's -ffat-lto-objects flag is silently ignored by Clang (different LTO model)",
     patterns: &["ignored-optimization-argument"],
     require_prefix: None,
     exclude_if_contains: &[],
@@ -958,16 +964,18 @@ const UNKNOWN_WARNING_FLAG: ErrorPattern = ErrorPattern {
     patterns: &["unknown warning option"],
     require_prefix: None,
     // Exclude configure probe lines that intentionally test for flag support.
-    exclude_if_contains: &["checking whether", "supports compile flag", "compiler handles"],
+    exclude_if_contains: &[
+        "checking whether",
+        "supports compile flag",
+        "compiler handles",
+    ],
     dedup_by_extracted_key: true, // key = flag name
     suppressed_by: &[],
     class: crate::models::FindingClass::Toolchain,
 };
 
-pub static OBSERVATION_PATTERNS: &[&ErrorPattern] = &[
-    &LTO_FAT_OBJECTS_IGNORED,
-    &UNKNOWN_WARNING_FLAG,
-];
+pub static OBSERVATION_PATTERNS: &[&ErrorPattern] =
+    &[&LTO_FAT_OBJECTS_IGNORED, &UNKNOWN_WARNING_FLAG];
 
 // ---------------------------------------------------------------------------
 // Pattern matching helper
@@ -978,10 +986,7 @@ pub static OBSERVATION_PATTERNS: &[&ErrorPattern] = &[
 /// Returns `Some(pattern)` if the line matches any needle in the pattern,
 /// the optional `require_prefix` is satisfied, and none of the
 /// `exclude_if_contains` strings are present.
-pub fn match_pattern<'a>(
-    line: &str,
-    patterns: &'a [&'a ErrorPattern],
-) -> Option<&'a ErrorPattern> {
+pub fn match_pattern<'a>(line: &str, patterns: &'a [&'a ErrorPattern]) -> Option<&'a ErrorPattern> {
     for pattern in patterns {
         // Check prefix requirement first (fast rejection).
         if let Some(prefix) = pattern.require_prefix {
@@ -990,7 +995,11 @@ pub fn match_pattern<'a>(
             }
         }
         // Check exclusions.
-        if pattern.exclude_if_contains.iter().any(|exc| line.contains(exc)) {
+        if pattern
+            .exclude_if_contains
+            .iter()
+            .any(|exc| line.contains(exc))
+        {
             continue;
         }
         // Check needles.
@@ -1059,7 +1068,8 @@ mod tests {
     #[test]
     fn link_missing_symbol_not_matching_command_line() {
         // The actual linker error line.
-        let p = match_error("/usr/bin/ld: .libs/libbarcode.so: undefined reference to `rpl_calloc'");
+        let p =
+            match_error("/usr/bin/ld: .libs/libbarcode.so: undefined reference to `rpl_calloc'");
         assert!(p.is_some());
         assert_eq!(p.unwrap().key, "LINK_MISSING_SYMBOL");
     }
@@ -1074,7 +1084,8 @@ mod tests {
 
     #[test]
     fn implicit_function_configure_probe_excluded() {
-        let p = match_error("checking whether compiler handles -Wimplicit-function-declaration... yes");
+        let p =
+            match_error("checking whether compiler handles -Wimplicit-function-declaration... yes");
         assert!(p.is_none() || p.unwrap().key != "IMPLICIT_FUNCTION_DECLARATION");
     }
 
@@ -1196,7 +1207,9 @@ mod tests {
 
     #[test]
     fn configure_working_compiler() {
-        let p = match_error("configure: error: could not find a working compiler, see config.log for details");
+        let p = match_error(
+            "configure: error: could not find a working compiler, see config.log for details",
+        );
         assert!(p.is_some());
         assert_eq!(p.unwrap().key, "CONFIGURE_COMPILER_TEST_FAILED");
     }

@@ -98,7 +98,7 @@ pub async fn export_data(
 ///
 /// Each row represents one distinct profile (by profile_name).  The flags are
 /// parsed from the snapshotted TOML and reduced to a human-readable summary
-        /// and a full JSON representation for the frontend to use without any TOML parsing.
+/// and a full JSON representation for the frontend to use without any TOML parsing.
 async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS profile_configs (
@@ -127,14 +127,12 @@ async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {
         let profile_name: String = row.get("profile_name");
         let content: String = row.get("profile_content");
 
-        let parsed: ProfileForExport = toml::from_str(&content).with_context(|| {
-            format!("Failed to parse profile_content for '{profile_name}'")
-        })?;
+        let parsed: ProfileForExport = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse profile_content for '{profile_name}'"))?;
 
         // Collect unique flag *values* (deduplicated — the same flag is often
         // applied to both DEB_CFLAGS_APPEND and DEB_CXXFLAGS_APPEND).
-        let unique_flags: BTreeSet<String> =
-            parsed.flags.iter().map(|f| f.flag.clone()).collect();
+        let unique_flags: BTreeSet<String> = parsed.flags.iter().map(|f| f.flag.clone()).collect();
 
         let has_flags = if unique_flags.is_empty() { 0i64 } else { 1i64 };
 
@@ -292,12 +290,15 @@ mod tests {
                 compiler_type: CompilerType::Clang,
                 version: "18".to_string(),
             },
-            target: Target { series: "noble".to_string() },
+            target: Target {
+                series: "noble".to_string(),
+            },
             flags: vec![],
             name: "clang-18-noble".to_string(),
             // Valid TOML: export_data parses profile_content per batch.
-            raw_content: "[compiler]\ntype = \"clang\"\nversion = \"18\"\n[target]\nseries = \"noble\"\n"
-                .to_string(),
+            raw_content:
+                "[compiler]\ntype = \"clang\"\nversion = \"18\"\n[target]\nseries = \"noble\"\n"
+                    .to_string(),
         }
     }
 
@@ -317,14 +318,16 @@ mod tests {
         let pool = db::init(&dir.path().join("rebuilder.db")).await.unwrap();
 
         let profile = sample_profile();
-        let batch =
-            db::create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
-                .await
-                .unwrap();
+        let batch = db::create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
 
         let now = chrono::Utc::now();
         let mut build_ids = Vec::new();
-        for (pkg, log) in [("foo", "foo log line 1\nfoo log line 2"), ("bar", "bar log")] {
+        for (pkg, log) in [
+            ("foo", "foo log line 1\nfoo log line 2"),
+            ("bar", "bar log"),
+        ] {
             let build = db::insert_build(
                 &pool,
                 &db::NewBuild {
@@ -375,8 +378,12 @@ mod tests {
         // which must be left alone.
         let out = dir.path().join("export");
         fs::create_dir_all(out.join("logs")).await.unwrap();
-        fs::write(out.join("logs/stale.log"), "stale").await.unwrap();
-        fs::write(out.join("logs/README.txt"), "keep me").await.unwrap();
+        fs::write(out.join("logs/stale.log"), "stale")
+            .await
+            .unwrap();
+        fs::write(out.join("logs/README.txt"), "keep me")
+            .await
+            .unwrap();
 
         export_data(&pool, &out, None).await.unwrap();
 
@@ -386,10 +393,7 @@ mod tests {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
         names.sort();
-        let mut expected: Vec<String> = build_ids
-            .iter()
-            .map(|id| format!("{id}.log"))
-            .collect();
+        let mut expected: Vec<String> = build_ids.iter().map(|id| format!("{id}.log")).collect();
         expected.push("README.txt".to_string());
         expected.sort();
         assert_eq!(
@@ -408,10 +412,11 @@ mod tests {
             .connect(&format!("sqlite:{}", out.join("rebuild.db").display()))
             .await
             .unwrap();
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM builds WHERE build_log IS NOT NULL")
-            .fetch_one(&export_pool)
-            .await
-            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM builds WHERE build_log IS NOT NULL")
+                .fetch_one(&export_pool)
+                .await
+                .unwrap();
         export_pool.close().await;
         assert_eq!(remaining, 0, "exported db must not carry log blobs");
     }

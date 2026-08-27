@@ -53,17 +53,9 @@ pub struct BuildConfig {
 /// Builds are executed sequentially.  Returns the batch ID and aggregate
 /// statistics.  A Ctrl+C during any build cancels the current build and
 /// skips all remaining packages.
-pub async fn run_batch(
-    pool: &SqlitePool,
-    config: &BuildConfig,
-) -> Result<(Uuid, BatchStats)> {
-    let batch = db::create_batch(
-        pool,
-        &config.profile,
-        BuilderBackend::Sbuild,
-        &config.arch,
-    )
-    .await?;
+pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid, BatchStats)> {
+    let batch =
+        db::create_batch(pool, &config.profile, BuilderBackend::Sbuild, &config.arch).await?;
 
     info!(
         batch_id = %batch.id,
@@ -128,7 +120,10 @@ pub async fn run_batch(
             .await
             {
                 Ok(result) => {
-                    info!("{progress} {package_name} completed (attempt {attempt}): {}", result.status.as_str());
+                    info!(
+                        "{progress} {package_name} completed (attempt {attempt}): {}",
+                        result.status.as_str()
+                    );
                     let status = result.status;
                     // A failed DB write must not abort a long-running batch
                     // (the build itself already succeeded or failed); log it
@@ -148,7 +143,8 @@ pub async fn run_batch(
                     break;
                 }
                 Err(e) => {
-                    if e.to_string().contains("Interrupted by user") || cancel_token.is_cancelled() {
+                    if e.to_string().contains("Interrupted by user") || cancel_token.is_cancelled()
+                    {
                         info!("Batch interrupted by user, aborting remaining builds");
                         break;
                     }
@@ -166,7 +162,8 @@ pub async fn run_batch(
                         memory_limit_mb: None,
                         attempt_number: attempt,
                     };
-                    if let Err(se) = store_build_result(pool, batch.id, &error_result, config).await {
+                    if let Err(se) = store_build_result(pool, batch.id, &error_result, config).await
+                    {
                         error!("{progress} {package_name}: failed to store error result: {se}");
                     }
                     break;
@@ -200,8 +197,12 @@ async fn build_package(
 ) -> Result<BuildResult> {
     // Use a temp dir on real disk (not the RAM-backed /tmp tmpfs) to avoid
     // exhausting RAM with large source tarballs during long build runs.
-    std::fs::create_dir_all(&config.source_dir)
-        .with_context(|| format!("Failed to create source dir {}", config.source_dir.display()))?;
+    std::fs::create_dir_all(&config.source_dir).with_context(|| {
+        format!(
+            "Failed to create source dir {}",
+            config.source_dir.display()
+        )
+    })?;
     let temp_dir = tempfile::Builder::new()
         .tempdir_in(&config.source_dir)
         .context("Failed to create temp directory for source download")?;
@@ -270,13 +271,12 @@ async fn store_build_result(
     let now = chrono::Utc::now();
 
     // Scan findings first, while the log is still in memory.
-    let findings = if result.status.should_scan_for_errors()
-        || result.status.should_scan_for_observations()
-    {
-        scan_log(&result.build_log, result.status)
-    } else {
-        vec![]
-    };
+    let findings =
+        if result.status.should_scan_for_errors() || result.status.should_scan_for_observations() {
+            scan_log(&result.build_log, result.status)
+        } else {
+            vec![]
+        };
 
     // Decide whether to store the log based on policy.
     let log_blob: Option<Vec<u8>> = match config.store_logs {
@@ -326,6 +326,10 @@ async fn store_build_result(
 /// Gzip-compress bytes, returning the compressed form.
 fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data).context("Failed to write to gzip encoder")?;
-    encoder.finish().context("Failed to finish gzip compression")
+    encoder
+        .write_all(data)
+        .context("Failed to write to gzip encoder")?;
+    encoder
+        .finish()
+        .context("Failed to finish gzip compression")
 }

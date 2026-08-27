@@ -19,6 +19,9 @@ export DEBIAN_FRONTEND=noninteractive
 # outer shell's http_proxy / https_proxy env vars, so without this apt-get
 # update / install inside the chroot cannot reach the archive on hosts that
 # require a proxy.  An empty value leaves apt's default config untouched.
+# SC2157: __HTTP_PROXY__ is a placeholder substituted by the Rust pipeline
+# before this script reaches the shell; shellcheck sees the literal instead.
+# shellcheck disable=SC2157
 if [ -n "__HTTP_PROXY__" ]; then
     echo "Acquire::http::Proxy  \"__HTTP_PROXY__\";"  >  /etc/apt/apt.conf.d/99proxy
     echo "Acquire::https::Proxy \"__HTTP_PROXY__\";"  >> /etc/apt/apt.conf.d/99proxy

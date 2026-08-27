@@ -60,8 +60,8 @@ impl SystemdScopeCgroup {
     /// Read `memory.events` and return `true` if `oom_kill > 0`.
     /// Returns `Ok(false)` if the cgroup is gone (race lost).
     pub fn read_oom_kill(&self) -> Result<bool> {
-        let events = fs::read_to_string(self.cgroup_path.join("memory.events"))
-            .with_context(|| {
+        let events =
+            fs::read_to_string(self.cgroup_path.join("memory.events")).with_context(|| {
                 format!(
                     "Failed to read memory.events at {} (scope may be cleaned up)",
                     self.cgroup_path.display()

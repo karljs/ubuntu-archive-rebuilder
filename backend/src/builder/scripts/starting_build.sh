@@ -29,7 +29,10 @@ mkdir -p "$WRAPPER_DIR"
 
 # Create a wrapper script that execs the given compiler.
 # The '%%s' is intentional — sbuild expands '%s' before the shell runs,
-# so we double-escape to get a literal '%s' for printf.
+# so we double-escape to get a literal '%s' for printf.  SC2182 flags the
+# pre-sbuild '%%' as an escaped literal; the shell that actually executes
+# this sees '%s'.
+# shellcheck disable=SC2182
 create_wrapper() {
     local name="$1"
     local target="$2"

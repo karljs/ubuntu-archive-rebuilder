@@ -32,7 +32,10 @@ impl BuildStatus {
 
     /// Returns true if the build has reached a final state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::DepWait | Self::Timeout | Self::OomKilled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::DepWait | Self::Timeout | Self::OomKilled
+        )
     }
 
     /// Returns true if the build log should be scanned for error-level findings.
@@ -290,7 +293,9 @@ impl std::str::FromStr for StoreLogs {
             "all" => Ok(Self::All),
             "failures" => Ok(Self::Failures),
             "none" => Ok(Self::None),
-            other => Err(format!("unknown store-logs value '{other}': expected all, failures, or none")),
+            other => Err(format!(
+                "unknown store-logs value '{other}': expected all, failures, or none"
+            )),
         }
     }
 }

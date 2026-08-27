@@ -1,7 +1,7 @@
 //! Database operations — SQLite storage for batches, builds, and findings.
 
-use crate::models::{BuildStatus, BuilderBackend, FindingClass, FindingSeverity};
 pub use crate::models::{Batch, Build, BuildFinding};
+use crate::models::{BuildStatus, BuilderBackend, FindingClass, FindingSeverity};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -144,12 +144,11 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool> {
     // Detect by checking whether the column type has changed; we use the
     // presence of the new BLOB affinity as a proxy — if the column type is
     // still 'TEXT' the migration has not been applied yet.
-    let log_col_type: Option<String> = sqlx::query_scalar(
-        "SELECT type FROM pragma_table_info('builds') WHERE name = 'build_log'",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap_or(None);
+    let log_col_type: Option<String> =
+        sqlx::query_scalar("SELECT type FROM pragma_table_info('builds') WHERE name = 'build_log'")
+            .fetch_optional(&pool)
+            .await
+            .unwrap_or(None);
 
     if log_col_type.as_deref() != Some("BLOB") {
         sqlx::query(MIGRATION_004)
@@ -330,8 +329,7 @@ pub async fn list_batches(pool: &SqlitePool) -> Result<Vec<Batch>> {
     .collect()
 }
 
-const BATCH_SELECT_BY_ID: &str =
-    "SELECT id, name, compiler_type, compiler_version, series, arch,
+const BATCH_SELECT_BY_ID: &str = "SELECT id, name, compiler_type, compiler_version, series, arch,
             profile_name, profile_content, builder_backend, started_at, finished_at
      FROM batches WHERE id = ?";
 
@@ -457,13 +455,11 @@ pub async fn list_all_builds(pool: &SqlitePool) -> Result<Vec<Build>> {
 /// before migration 004 are handled by falling back to UTF-8 interpretation
 /// if gzip decompression fails.
 pub async fn get_build_log(pool: &SqlitePool, build_id: Uuid) -> Result<Option<String>> {
-    let row = sqlx::query(
-        "SELECT build_log FROM builds WHERE id = ?",
-    )
-    .bind(build_id.to_string())
-    .fetch_optional(pool)
-    .await
-    .context("Failed to fetch build log")?;
+    let row = sqlx::query("SELECT build_log FROM builds WHERE id = ?")
+        .bind(build_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .context("Failed to fetch build log")?;
 
     let Some(row) = row else { return Ok(None) };
     let blob: Option<Vec<u8>> = row.get("build_log");
@@ -492,9 +488,7 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
         batch_id: Uuid::parse_str(&batch_id_str)?,
         source_package: row.get("source_package"),
         version: row.get("version"),
-        status: status_str
-            .parse()
-            .map_err(|e: String| anyhow::anyhow!(e))?,
+        status: status_str.parse().map_err(|e: String| anyhow::anyhow!(e))?,
         build_duration_seconds: row.get("build_duration_seconds"),
         peak_memory_mb: row.get("peak_memory_mb"),
         compiler_detected: row.get("compiler_detected"),
@@ -514,6 +508,8 @@ fn build_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Build> {
 // ---------------------------------------------------------------------------
 
 /// Insert a build finding.
+// Args mirror the INSERT columns 1:1; a params struct would be ceremony.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_finding(
     pool: &SqlitePool,
     build_id: Uuid,
@@ -608,9 +604,7 @@ fn finding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BuildFinding> {
         severity: severity_str
             .parse()
             .map_err(|e: String| anyhow::anyhow!(e))?,
-        class: class_str
-            .parse()
-            .map_err(|e: String| anyhow::anyhow!(e))?,
+        class: class_str.parse().map_err(|e: String| anyhow::anyhow!(e))?,
     })
 }
 
@@ -655,8 +649,13 @@ pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchS
             _ => {}
         }
     }
-    stats.total = stats.pending + stats.building + stats.succeeded
-        + stats.failed + stats.dep_wait + stats.timeout + stats.oom_killed;
+    stats.total = stats.pending
+        + stats.building
+        + stats.succeeded
+        + stats.failed
+        + stats.dep_wait
+        + stats.timeout
+        + stats.oom_killed;
 
     // Carve out "environmental" failures: failed builds that have at least one
     // finding and whose findings are *all* environmental. These are infra
@@ -729,12 +728,30 @@ mod tests {
             .await
             .expect("connect in-memory");
         sqlx::query(SCHEMA).execute(&pool).await.expect("schema");
-        sqlx::query(MIGRATION_002).execute(&pool).await.expect("mig 002");
-        sqlx::query(MIGRATION_003).execute(&pool).await.expect("mig 003");
-        sqlx::query(MIGRATION_004).execute(&pool).await.expect("mig 004");
-        sqlx::query(MIGRATION_005).execute(&pool).await.expect("mig 005");
-        sqlx::query(MIGRATION_006).execute(&pool).await.expect("mig 006");
-        sqlx::query(MIGRATION_007).execute(&pool).await.expect("mig 007");
+        sqlx::query(MIGRATION_002)
+            .execute(&pool)
+            .await
+            .expect("mig 002");
+        sqlx::query(MIGRATION_003)
+            .execute(&pool)
+            .await
+            .expect("mig 003");
+        sqlx::query(MIGRATION_004)
+            .execute(&pool)
+            .await
+            .expect("mig 004");
+        sqlx::query(MIGRATION_005)
+            .execute(&pool)
+            .await
+            .expect("mig 005");
+        sqlx::query(MIGRATION_006)
+            .execute(&pool)
+            .await
+            .expect("mig 006");
+        sqlx::query(MIGRATION_007)
+            .execute(&pool)
+            .await
+            .expect("mig 007");
         pool
     }
 
@@ -744,7 +761,9 @@ mod tests {
                 compiler_type: CompilerType::Clang,
                 version: "18".to_string(),
             },
-            target: Target { series: "noble".to_string() },
+            target: Target {
+                series: "noble".to_string(),
+            },
             flags: vec![],
             name: "clang-18-noble".to_string(),
             raw_content: String::new(),
@@ -755,21 +774,25 @@ mod tests {
     async fn migration_005_adds_arch_and_component_columns() {
         let pool = mem_pool().await;
 
-        let batch_cols: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM pragma_table_info('batches') ORDER BY name",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert!(batch_cols.contains(&"arch".to_string()), "batches.arch missing");
+        let batch_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('batches') ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            batch_cols.contains(&"arch".to_string()),
+            "batches.arch missing"
+        );
 
-        let build_cols: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM pragma_table_info('builds') ORDER BY name",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert!(build_cols.contains(&"component".to_string()), "builds.component missing");
+        let build_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('builds') ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(
+            build_cols.contains(&"component".to_string()),
+            "builds.component missing"
+        );
     }
 
     #[tokio::test]
@@ -780,7 +803,10 @@ mod tests {
         // the guard in init() is actually necessary.
         let pool = mem_pool().await;
         let result = sqlx::query(MIGRATION_005).execute(&pool).await;
-        assert!(result.is_err(), "second migration 005 run should have failed");
+        assert!(
+            result.is_err(),
+            "second migration 005 run should have failed"
+        );
     }
 
     #[tokio::test]
@@ -797,7 +823,10 @@ mod tests {
         let by_id = get_batch(&pool, batch.id).await.unwrap().unwrap();
         assert_eq!(by_id.arch, "arm64");
 
-        let by_name = get_batch_by_name(&pool, &batch.name).await.unwrap().unwrap();
+        let by_name = get_batch_by_name(&pool, &batch.name)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(by_name.arch, "arm64");
 
         let latest = get_latest_batch(&pool).await.unwrap().unwrap();
@@ -1088,16 +1117,24 @@ mod tests {
     async fn migration_007_adds_oom_retry_columns() {
         let pool = mem_pool().await;
 
-        let build_cols: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM pragma_table_info('builds') ORDER BY name",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let build_cols: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('builds') ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
 
-        assert!(build_cols.contains(&"attempt_number".to_string()), "builds.attempt_number missing");
-        assert!(build_cols.contains(&"jobs".to_string()), "builds.jobs missing");
-        assert!(build_cols.contains(&"memory_limit_mb".to_string()), "builds.memory_limit_mb missing");
+        assert!(
+            build_cols.contains(&"attempt_number".to_string()),
+            "builds.attempt_number missing"
+        );
+        assert!(
+            build_cols.contains(&"jobs".to_string()),
+            "builds.jobs missing"
+        );
+        assert!(
+            build_cols.contains(&"memory_limit_mb".to_string()),
+            "builds.memory_limit_mb missing"
+        );
     }
 
     #[tokio::test]
@@ -1280,7 +1317,10 @@ mod tests {
         let stats = get_batch_stats(&pool, batch.id).await.unwrap();
         assert_eq!(stats.total, 1);
         assert_eq!(stats.environmental, 1);
-        assert_eq!(stats.failed, 0, "environmental-only failure must not count as failed");
+        assert_eq!(
+            stats.failed, 0,
+            "environmental-only failure must not count as failed"
+        );
         assert_eq!(stats.comparable_total(), 0);
     }
 

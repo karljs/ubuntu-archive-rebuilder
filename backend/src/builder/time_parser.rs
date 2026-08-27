@@ -34,14 +34,19 @@ pub fn parse_time_output(output: &str) -> ResourceMetrics {
             metrics.system_time_seconds = value.parse().ok();
         } else if let Some(value) = line.strip_prefix("Maximum resident set size (kbytes): ") {
             metrics.peak_memory_kb = value.parse().ok();
-        } else if let Some(value) = line.strip_prefix("Elapsed (wall clock) time (h:mm:ss or m:ss): ") {
+        } else if let Some(value) =
+            line.strip_prefix("Elapsed (wall clock) time (h:mm:ss or m:ss): ")
+        {
             metrics.wall_time_seconds = parse_wall_time(value);
         } else if let Some(value) = line.strip_prefix("Exit status: ") {
             metrics.exit_status = value.parse().ok();
         }
     }
 
-    if !output.trim().is_empty() && metrics.exit_status.is_none() && metrics.wall_time_seconds.is_none() {
+    if !output.trim().is_empty()
+        && metrics.exit_status.is_none()
+        && metrics.wall_time_seconds.is_none()
+    {
         warn!("Non-empty /usr/bin/time output but no recognisable fields parsed — check time output format");
     }
 

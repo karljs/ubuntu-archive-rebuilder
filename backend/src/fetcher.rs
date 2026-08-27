@@ -56,11 +56,11 @@ pub fn default_mirror_for_arch(arch: &str) -> &'static str {
 ///
 /// * `series`     — Ubuntu series name, e.g. `"noble"`.
 /// * `components` — Archive components to fetch, e.g. `["main"]` or
-///                  `["main", "universe"]`.
+///   `["main", "universe"]`.
 /// * `arch`       — Target build architecture, e.g. `"amd64"`.  Used to
-///                  exclude source packages that cannot build on this arch.
+///   exclude source packages that cannot build on this arch.
 /// * `mirror_url` — Base URL of the Ubuntu archive mirror, without trailing
-///                  slash, e.g. `"https://archive.ubuntu.com/ubuntu"`.
+///   slash, e.g. `"https://archive.ubuntu.com/ubuntu"`.
 ///
 /// # Returns
 ///
@@ -126,9 +126,7 @@ fn parse_sources<R: std::io::Read>(
         if line.is_empty() {
             // Blank line — end of stanza.  Emit the package if we have both
             // fields and it passes the arch filter.
-            if let (Some(pkg), Some(arch_field)) =
-                (current_package.take(), current_arch.take())
-            {
+            if let (Some(pkg), Some(arch_field)) = (current_package.take(), current_arch.take()) {
                 if arch_matches(&arch_field, arch) {
                     packages.push((pkg, component.to_string()));
                 }
@@ -269,6 +267,9 @@ Priority: optional
         let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"hello"), "should include arch=any");
         assert!(names.contains(&"data-pkg"), "should include arch=all");
-        assert!(!names.contains(&"arch-specific"), "should exclude i386-only on amd64");
+        assert!(
+            !names.contains(&"arch-specific"),
+            "should exclude i386-only on amd64"
+        );
     }
 }
