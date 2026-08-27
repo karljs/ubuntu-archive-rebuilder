@@ -7,9 +7,10 @@ use flate2::read::GzDecoder;
 use std::io::{BufRead, BufReader};
 
 /// amd64/i386: primary archive. Everything else: ports.
+/// *.clouds.archive.ubuntu.com is a full mirror of archive.ubuntu.com.
 pub fn default_mirror_for_arch(arch: &str) -> &'static str {
     match arch {
-        "amd64" | "i386" => "https://archive.ubuntu.com/ubuntu",
+        "amd64" | "i386" => "https://us.clouds.archive.ubuntu.com/ubuntu",
         _ => "https://ports.ubuntu.com/ubuntu-ports",
     }
 }
@@ -151,7 +152,7 @@ mod tests {
     fn test_default_mirror_amd64() {
         assert_eq!(
             default_mirror_for_arch("amd64"),
-            "https://archive.ubuntu.com/ubuntu"
+            "https://us.clouds.archive.ubuntu.com/ubuntu"
         );
     }
 
