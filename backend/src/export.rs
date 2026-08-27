@@ -70,17 +70,13 @@ pub async fn export_data(
         .context("Failed to compact export database")?;
 
     write_profile_configs(&export_pool).await?;
-    write_export_meta(&export_pool, Path::new(DISTRO_INFO_CSV)).await?;
+    write_export_meta(&export_pool, Path::new(crate::distro_info::DISTRO_INFO_CSV)).await?;
 
     export_pool.close().await;
 
     info!(path = %db_path.display(), "Wrote export database");
     Ok(())
 }
-
-// Authoritative Ubuntu release order; rows are in release order and the
-// file covers future series. Ships with distro-info (ubuntu-dev-tools dep).
-const DISTRO_INFO_CSV: &str = "/usr/share/distro-info/ubuntu.csv";
 
 // export_meta.series_order: series present in the data, in release order.
 // Series unknown to the CSV (typos, PPAs) append by first-seen started_at.
@@ -92,7 +88,10 @@ async fn write_export_meta(pool: &SqlitePool, distro_info: &Path) -> Result<()> 
             return Ok(());
         }
     };
-    let known = parse_series_column(&csv);
+    let known: Vec<String> = crate::distro_info::parse_csv(&csv)
+        .iter()
+        .map(|r| r.series.clone())
+        .collect();
     if known.is_empty() {
         warn!(
             "{} has no usable series column; series_order omitted",
@@ -137,22 +136,6 @@ async fn write_export_meta(pool: &SqlitePool, distro_info: &Path) -> Result<()> 
 
     info!(count = order.len(), "Wrote export_meta.series_order");
     Ok(())
-}
-
-fn parse_series_column(csv: &str) -> Vec<String> {
-    let mut lines = csv.lines();
-    let Some(header) = lines.next() else {
-        return vec![];
-    };
-    let Some(idx) = header.split(',').position(|c| c.trim() == "series") else {
-        return vec![];
-    };
-    lines
-        .filter_map(|l| l.split(',').nth(idx))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 async fn write_profile_configs(pool: &SqlitePool) -> Result<()> {

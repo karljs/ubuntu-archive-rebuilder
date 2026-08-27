@@ -43,6 +43,20 @@ pub enum CompilerType {
     Gcc,
 }
 
+impl std::str::FromStr for CompilerType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "clang" => Ok(Self::Clang),
+            "gcc" => Ok(Self::Gcc),
+            other => Err(format!(
+                "unknown compiler type '{other}' (expected: clang, gcc)"
+            )),
+        }
+    }
+}
+
 impl CompilerType {
     pub fn as_str(&self) -> &'static str {
         match self {

@@ -1,10 +1,15 @@
 //! CLI entry point.
 
-use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Args, Parser, Subcommand};
 use rebuilder::{
-    builder, builder::ChrootMode, db, export, fetcher, models::StoreLogs, profile::Profile,
+    builder,
+    builder::ChrootMode,
+    db, defaults, distro_info, export, fetcher,
+    models::StoreLogs,
+    profile::{CompilerType, Profile},
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -29,6 +34,42 @@ struct Cli {
     command: Commands,
 }
 
+/// Flags shared by build commands.
+#[derive(Args)]
+struct BuildArgs {
+    /// Build timeout per package, in seconds.
+    #[arg(long, default_value = "14400")]
+    timeout: u64,
+
+    /// Parallel make jobs per build (default: CPU count).
+    #[arg(short, long)]
+    jobs: Option<usize>,
+
+    /// Run package test suites.
+    #[arg(long, default_value = "false")]
+    run_tests: bool,
+
+    /// Log storage policy: all, failures, or none.
+    #[arg(long, default_value = "all")]
+    store_logs: StoreLogs,
+
+    /// Base directory for source downloads (real disk, not tmpfs).
+    #[arg(long, default_value = "/var/tmp/rebuild-source")]
+    source_dir: PathBuf,
+
+    /// Target build architecture (non-amd64/i386 uses ports.ubuntu.com).
+    #[arg(long, default_value = "amd64")]
+    arch: String,
+
+    /// Per-build cgroup memory limit in MB; 0 disables.
+    #[arg(long, default_value = "14336")]
+    memory_limit_mb: u64,
+
+    /// Chroot backend: unshare (ephemeral, default) or schroot (persistent).
+    #[arg(long, default_value = "unshare", env = "REBUILD_CHROOT_MODE")]
+    chroot_mode: ChrootMode,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Build packages using a compiler profile.
@@ -41,37 +82,43 @@ enum Commands {
         #[arg(long)]
         packages: PathBuf,
 
-        /// Build timeout per package, in seconds.
-        #[arg(long, default_value = "14400")]
-        timeout: u64,
+        #[command(flatten)]
+        build: BuildArgs,
+    },
 
-        /// Parallel make jobs per build (default: CPU count).
-        #[arg(short, long)]
-        jobs: Option<usize>,
+    /// Build the archive's default gcc and clang for each maintained LTS series.
+    ///
+    /// Series come from distro-info, compiler defaults from the archive's
+    /// gcc/clang metapackages, and package lists are fetched fresh from the
+    /// archive. Profiles are generated in memory (clang >= 15 gets
+    /// -gdwarf-4; dwz cannot process Clang's DWARF5 output).
+    RunDefaults {
+        /// Series to build (default: maintained LTS releases).
+        #[arg(long, value_delimiter = ',')]
+        series: Vec<String>,
 
-        /// Run package test suites.
-        #[arg(long, default_value = "false")]
-        run_tests: bool,
+        /// Compilers to build (default: gcc,clang).
+        #[arg(long, value_delimiter = ',')]
+        compilers: Vec<String>,
 
-        /// Log storage policy: all, failures, or none.
-        #[arg(long, default_value = "all")]
-        store_logs: StoreLogs,
+        /// Archive components for the package list (default: main).
+        #[arg(long, default_value = "main", value_delimiter = ',')]
+        components: Vec<String>,
 
-        /// Base directory for source downloads (real disk, not tmpfs).
-        #[arg(long, default_value = "/var/tmp/rebuild-source")]
-        source_dir: PathBuf,
+        /// Package list file; overrides fetching lists from the archive.
+        #[arg(long)]
+        packages: Option<PathBuf>,
 
-        /// Target build architecture (non-amd64/i386 uses ports.ubuntu.com).
-        #[arg(long, default_value = "amd64")]
-        arch: String,
+        /// Print the plan without building.
+        #[arg(long)]
+        dry_run: bool,
 
-        /// Per-build cgroup memory limit in MB; 0 disables.
-        #[arg(long, default_value = "14336")]
-        memory_limit_mb: u64,
+        /// Export the frontend database here after building.
+        #[arg(long)]
+        export_dir: Option<PathBuf>,
 
-        /// Chroot backend: unshare (ephemeral, default) or schroot (persistent).
-        #[arg(long, default_value = "unshare", env = "REBUILD_CHROOT_MODE")]
-        chroot_mode: ChrootMode,
+        #[command(flatten)]
+        build: BuildArgs,
     },
 
     /// List all batches.
@@ -145,22 +192,16 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to initialise database")?;
 
+    let verbose = cli.verbose;
     match cli.command {
         Commands::Build {
             profile: profile_path,
             packages,
-            timeout,
-            jobs,
-            run_tests,
-            store_logs,
-            source_dir,
-            arch,
-            memory_limit_mb,
-            chroot_mode,
+            build: shared,
         } => {
             let profile = Profile::load(&profile_path)?;
 
-            if chroot_mode == ChrootMode::Unshare {
+            if shared.chroot_mode == ChrootMode::Unshare {
                 profile.validate_series_available()?;
             }
 
@@ -169,11 +210,7 @@ async fn main() -> Result<()> {
                 bail!("No packages to build");
             }
 
-            let jobs = jobs.unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            });
+            let jobs = default_jobs(shared.jobs);
 
             info!(
                 packages = package_list.len(),
@@ -181,24 +218,24 @@ async fn main() -> Result<()> {
                 compiler = %profile.compiler.compiler_type,
                 version = %profile.compiler.version,
                 series = %profile.target.series,
-                arch = %arch,
+                arch = %shared.arch,
                 jobs,
-                chroot_mode = %chroot_mode,
+                chroot_mode = %shared.chroot_mode,
                 "Starting build run"
             );
 
             let config = builder::BuildConfig {
                 profile,
                 packages: package_list,
-                timeout_seconds: timeout,
+                timeout_seconds: shared.timeout,
                 verbose: cli.verbose,
-                run_tests,
+                run_tests: shared.run_tests,
                 jobs,
-                store_logs,
-                source_dir,
-                arch,
-                memory_limit_mb,
-                chroot_mode,
+                store_logs: shared.store_logs,
+                source_dir: shared.source_dir,
+                arch: shared.arch,
+                memory_limit_mb: shared.memory_limit_mb,
+                chroot_mode: shared.chroot_mode,
             };
 
             let (batch_id, stats) = builder::run_batch(&pool, &config).await?;
@@ -219,6 +256,31 @@ async fn main() -> Result<()> {
             println!("  Dep-wait: {}", stats.dep_wait);
             println!("  Timeout: {}", stats.timeout);
             println!("  Oom-killed: {}", stats.oom_killed);
+        }
+
+        Commands::RunDefaults {
+            series,
+            compilers,
+            components,
+            packages,
+            dry_run,
+            export_dir,
+            build: shared,
+        } => {
+            run_defaults(
+                &pool,
+                verbose,
+                RunDefaultsArgs {
+                    series,
+                    compilers,
+                    components,
+                    packages,
+                    dry_run,
+                    export_dir,
+                    shared,
+                },
+            )
+            .await?;
         }
 
         Commands::List => {
@@ -415,6 +477,196 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+type PackageList = Vec<(String, Option<String>)>;
+
+struct RunDefaultsArgs {
+    series: Vec<String>,
+    compilers: Vec<String>,
+    components: Vec<String>,
+    packages: Option<PathBuf>,
+    dry_run: bool,
+    export_dir: Option<PathBuf>,
+    shared: BuildArgs,
+}
+
+fn default_jobs(jobs: Option<usize>) -> usize {
+    jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    })
+}
+
+async fn run_defaults(pool: &sqlx::SqlitePool, verbose: bool, args: RunDefaultsArgs) -> Result<()> {
+    let shared = &args.shared;
+
+    // gcc first so baselines exist before the clang comparisons.
+    let requested = if args.compilers.is_empty() {
+        vec!["gcc".to_string(), "clang".to_string()]
+    } else {
+        args.compilers
+    };
+    let mut compilers: Vec<CompilerType> = Vec::new();
+    for c in requested {
+        let parsed: CompilerType = c.parse().map_err(|e: String| anyhow!(e))?;
+        if !compilers.contains(&parsed) {
+            compilers.push(parsed);
+        }
+    }
+    compilers.sort_by_key(|c| if *c == CompilerType::Gcc { 0 } else { 1 });
+
+    let series_list: Vec<String> = if args.series.is_empty() {
+        let csv = std::fs::read_to_string(distro_info::DISTRO_INFO_CSV).context(
+            "failed to read distro-info; install the distro-info package or pass --series",
+        )?;
+        let rows = distro_info::parse_csv(&csv);
+        let lts = distro_info::maintained_lts(&rows, chrono::Utc::now().date_naive());
+        if lts.is_empty() {
+            bail!("no maintained LTS series found; pass --series");
+        }
+        lts
+    } else {
+        args.series
+    };
+
+    // Package list per series, or one shared list from --packages.
+    let mut package_lists: HashMap<String, PackageList> = HashMap::new();
+    if let Some(ref path) = args.packages {
+        let list = read_package_list(path)?;
+        if list.is_empty() {
+            bail!("No packages to build");
+        }
+        for s in &series_list {
+            package_lists.insert(s.clone(), list.clone());
+        }
+    } else {
+        for s in &series_list {
+            let s2 = s.clone();
+            let arch2 = shared.arch.clone();
+            let mirror2 = fetcher::default_mirror_for_arch(&shared.arch).to_string();
+            let comps2 = args.components.clone();
+            let list = tokio::task::spawn_blocking(move || {
+                let comp_refs: Vec<&str> = comps2.iter().map(String::as_str).collect();
+                fetcher::fetch_package_list(&s2, &comp_refs, &arch2, &mirror2)
+            })
+            .await
+            .context("package list fetch task panicked")??;
+            if list.is_empty() {
+                bail!(
+                    "no packages found for series {s} (components: {})",
+                    args.components.join(",")
+                );
+            }
+            let list: PackageList = list
+                .into_iter()
+                .map(|(name, comp)| (name, Some(comp)))
+                .collect();
+            package_lists.insert(s.clone(), list);
+        }
+    }
+
+    let mirror = fetcher::default_mirror_for_arch(&shared.arch).to_string();
+    let mut index_cache: defaults::IndexCache = HashMap::new();
+    let mut plan: Vec<(Profile, PackageList)> = Vec::new();
+    for s in &series_list {
+        for c in &compilers {
+            let version =
+                defaults::default_compiler_version(s, *c, &shared.arch, &mirror, &mut index_cache)
+                    .with_context(|| format!("resolving default {} for {s}", c.as_str()))?;
+            let profile = defaults::generate_profile(s, *c, &version);
+            plan.push((profile, package_lists[s].clone()));
+        }
+    }
+
+    let total = plan.len();
+    println!(
+        "Plan: {total} batch(es) across {} series",
+        series_list.len()
+    );
+    for (profile, pkgs) in &plan {
+        let mut flags: Vec<&str> = profile.flags.iter().map(|f| f.flag.as_str()).collect();
+        flags.sort();
+        flags.dedup();
+        let flags_str = if flags.is_empty() {
+            String::new()
+        } else {
+            format!("  flags: {}", flags.join(" "))
+        };
+        println!(
+            "  {:<22} {:<6} {:<10} {:>6} pkgs{}",
+            profile.name,
+            profile.compiler.compiler_type,
+            profile.target.series,
+            pkgs.len(),
+            flags_str
+        );
+    }
+    if args.dry_run {
+        println!("[dry-run] nothing built.");
+        return Ok(());
+    }
+
+    let jobs = default_jobs(shared.jobs);
+    let mut failures: Vec<String> = Vec::new();
+    for (idx, (profile, pkgs)) in plan.into_iter().enumerate() {
+        println!();
+        println!(
+            "[{}/{}] {} ({} packages)",
+            idx + 1,
+            total,
+            profile.name,
+            pkgs.len()
+        );
+        if shared.chroot_mode == ChrootMode::Unshare {
+            profile.validate_series_available()?;
+        }
+        let config = builder::BuildConfig {
+            profile: profile.clone(),
+            packages: pkgs,
+            timeout_seconds: shared.timeout,
+            verbose,
+            run_tests: shared.run_tests,
+            jobs,
+            store_logs: shared.store_logs,
+            source_dir: shared.source_dir.clone(),
+            arch: shared.arch.clone(),
+            memory_limit_mb: shared.memory_limit_mb,
+            chroot_mode: shared.chroot_mode,
+        };
+        match builder::run_batch(pool, &config).await {
+            Ok((_id, stats)) => println!(
+                "  {} succeeded, {} failed, {} dep-wait, {} timeout, {} oom-killed of {}",
+                stats.succeeded,
+                stats.failed,
+                stats.dep_wait,
+                stats.timeout,
+                stats.oom_killed,
+                stats.total
+            ),
+            Err(e) => {
+                eprintln!("  batch failed: {e:#}");
+                failures.push(profile.name);
+            }
+        }
+    }
+
+    if let Some(dir) = &args.export_dir {
+        export::export_data(pool, dir, None).await?;
+        println!("Exported to {}", dir.display());
+    } else {
+        println!("Skipping export; pass --export-dir <dir> to export for the frontend.");
+    }
+
+    if !failures.is_empty() {
+        bail!(
+            "{} batch(es) failed: {}",
+            failures.len(),
+            failures.join(", ")
+        );
+    }
     Ok(())
 }
 

@@ -619,8 +619,22 @@ mod tests {
 
     #[test]
     fn starting_build_verifies_every_replaced_compiler() {
-        assert!(STARTING_BUILD_SCRIPT.contains("\"${REPLACED[@]}\""));
+        assert!(STARTING_BUILD_SCRIPT.contains("for name in $(all_names)"));
         assert!(STARTING_BUILD_SCRIPT.contains("compiler verification failed"));
+    }
+
+    #[test]
+    fn starting_build_avoids_sbuild_command_mangling() {
+        // Regression: sbuild flattens array references to empty strings and
+        // expands bare percent sequences; the script must use neither.
+        assert!(
+            !STARTING_BUILD_SCRIPT.contains("[@]"),
+            "array references do not survive sbuild command processing"
+        );
+        assert!(
+            !STARTING_BUILD_SCRIPT.contains("%%s\n\"\n"),
+            "unexpected doubled-percent literal"
+        );
     }
 
     #[test]

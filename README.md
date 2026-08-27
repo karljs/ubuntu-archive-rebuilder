@@ -50,6 +50,27 @@ $BIN export --output-dir ../frontend/data
 python3 -m http.server 8000 --directory ../frontend
 ```
 
+## Default-compiler runs
+
+`run-defaults` builds the archive's default `gcc` and `clang` for every
+maintained LTS release, fetching package lists fresh from the archive:
+
+```bash
+$BIN run-defaults --dry-run               # show the plan, build nothing
+$BIN run-defaults                         # build it all (gcc first, then clang)
+$BIN run-defaults --export-dir ../frontend/data
+```
+
+Series come from distro-info and compiler defaults from the archive's own
+`gcc`/`clang` metapackages, so new releases need no updates here. Profiles
+are generated in memory and snapshotted into the database like hand-written
+ones; clang >= 15 automatically gets `-gdwarf-4` (dwz cannot process
+Clang's DWARF5 output). Options: `--series`, `--compilers`, `--components`,
+`--packages FILE`, plus the shared build flags (`--arch`, `--jobs`,
+`--timeout`, `--store-logs`, `--memory-limit-mb`, `--chroot-mode`). A
+failed batch does not stop the rest; the command exits non-zero if any
+batch failed.
+
 ## Profiles
 
 A profile is a TOML file declaring the compiler and any flag overrides:
