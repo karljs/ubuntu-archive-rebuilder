@@ -621,9 +621,21 @@ fn finding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<BuildFinding> {
 // ---------------------------------------------------------------------------
 
 /// Get aggregate build counts by status for a batch.
+///
+/// Only each package's *final* attempt is counted: with the OOM-retry flow,
+/// a package can have attempt 1 (oom_killed) and attempt 2 (e.g. succeeded)
+/// in the same batch.  Counting raw rows would double-count the package and
+/// skew totals and success rates.  Earlier attempts remain visible in the
+/// per-build rows; they just don't feed the aggregates.
 pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchStats> {
     let rows = sqlx::query(
-        "SELECT status, COUNT(*) as count FROM builds WHERE batch_id = ? GROUP BY status",
+        "SELECT status, COUNT(*) as count FROM builds b
+         WHERE b.batch_id = ?
+           AND b.attempt_number = (
+               SELECT MAX(b2.attempt_number) FROM builds b2
+               WHERE b2.batch_id = b.batch_id AND b2.source_package = b.source_package
+           )
+         GROUP BY status",
     )
     .bind(batch_id.to_string())
     .fetch_all(pool)
@@ -652,9 +664,14 @@ pub async fn get_batch_stats(pool: &SqlitePool, batch_id: Uuid) -> Result<BatchS
     // finding and whose findings are *all* environmental. These are infra
     // artifacts (e.g. parallel-install races), not toolchain failures, so they
     // are split out of `failed` and excluded from compiler comparison.
+    // Restricted to each package's final attempt, matching the stats query.
     let env_failures: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM builds b
          WHERE b.batch_id = ? AND b.status = 'failed'
+           AND b.attempt_number = (
+               SELECT MAX(b2.attempt_number) FROM builds b2
+               WHERE b2.batch_id = b.batch_id AND b2.source_package = b.source_package
+           )
            AND EXISTS (SELECT 1 FROM build_findings f WHERE f.build_id = b.id)
            AND NOT EXISTS (
                SELECT 1 FROM build_findings f
@@ -1147,6 +1164,126 @@ mod tests {
         assert_eq!(builds[0].status, BuildStatus::OomKilled);
         assert_eq!(builds[1].attempt_number, 2);
         assert_eq!(builds[1].status, BuildStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn get_batch_stats_counts_final_attempt_per_package() {
+        // Regression: with OOM retry, a package has attempt 1 (oom_killed) and
+        // attempt 2 (succeeded) in the same batch.  Stats must count the
+        // package once, by its final attempt — not both rows.
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+        let now = Utc::now();
+
+        for (attempt, status, jobs) in [
+            (1, BuildStatus::OomKilled, Some(8)),
+            (2, BuildStatus::Succeeded, Some(1)),
+        ] {
+            insert_build(
+                &pool,
+                &NewBuild {
+                    batch_id: batch.id,
+                    source_package: "foo",
+                    version: "1.0",
+                    status,
+                    build_duration_seconds: None,
+                    peak_memory_mb: None,
+                    build_log: None,
+                    compiler_detected: None,
+                    submitted_at: now,
+                    completed_at: Some(now),
+                    component: None,
+                    attempt_number: attempt,
+                    jobs,
+                    memory_limit_mb: Some(14336),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // A second package with a single attempt, for a stable denominator.
+        insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "bar",
+                version: "1.0",
+                status: BuildStatus::Failed,
+                build_duration_seconds: None,
+                peak_memory_mb: None,
+                build_log: None,
+                compiler_detected: None,
+                submitted_at: now,
+                completed_at: Some(now),
+                component: None,
+                attempt_number: 1,
+                jobs: None,
+                memory_limit_mb: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let stats = get_batch_stats(&pool, batch.id).await.unwrap();
+        assert_eq!(stats.total, 2, "foo must count once, not twice");
+        assert_eq!(stats.succeeded, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.oom_killed, 0, "superseded OOM attempt must not count");
+    }
+
+    #[tokio::test]
+    async fn get_batch_stats_environmental_failure_excluded_from_failed() {
+        // A final-attempt failed build whose findings are all environmental
+        // is split out of `failed` (it must not count against the compiler).
+        let pool = mem_pool().await;
+        let profile = sample_profile();
+        let batch = create_batch(&pool, &profile, BuilderBackend::Sbuild, "amd64")
+            .await
+            .unwrap();
+        let now = Utc::now();
+
+        let env_build = insert_build(
+            &pool,
+            &NewBuild {
+                batch_id: batch.id,
+                source_package: "env-pkg",
+                version: "1.0",
+                status: BuildStatus::Failed,
+                build_duration_seconds: None,
+                peak_memory_mb: None,
+                build_log: None,
+                compiler_detected: None,
+                submitted_at: now,
+                completed_at: Some(now),
+                component: None,
+                attempt_number: 1,
+                jobs: None,
+                memory_limit_mb: None,
+            },
+        )
+        .await
+        .unwrap();
+        insert_finding(
+            &pool,
+            env_build.id,
+            "PARALLEL_INSTALL_RACE",
+            "install race",
+            "install: cannot create directory",
+            Some(1),
+            FindingSeverity::Error,
+            FindingClass::Environmental,
+        )
+        .await
+        .unwrap();
+
+        let stats = get_batch_stats(&pool, batch.id).await.unwrap();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.environmental, 1);
+        assert_eq!(stats.failed, 0, "environmental-only failure must not count as failed");
+        assert_eq!(stats.comparable_total(), 0);
     }
 
     #[tokio::test]
