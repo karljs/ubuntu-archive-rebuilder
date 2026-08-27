@@ -186,12 +186,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
                         Ok(Some(line)) => {
                             if config.verbose { eprintln!("{line}"); }
                             trace!(stderr = true, "{line}");
-                            if is_time_output(&line) {
-                                time_output.push_str(&line);
-                                time_output.push('\n');
-                            } else {
-                                log_lines.push(line);
-                            }
+                            classify_stderr_line(line, &mut log_lines, &mut time_output);
                         }
                         Ok(None) => stderr_done = true,
                         Err(e) => { debug!("stderr read error: {e}"); stderr_done = true; }
@@ -208,7 +203,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         Ok(Err(e)) => {
             info!("Killing process group (pgid={pgid}) due to: {e}");
             kill_process_group(pgid).await;
-            drain_pipes(&mut stdout_lines, &mut stderr_lines).await;
+            drain_pipes(&mut stdout_lines, &mut stderr_lines, &mut log_lines, &mut time_output).await;
             let _ = child.wait().await;
             return Err(e);
         }
@@ -216,7 +211,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
             timed_out = true;
             info!("Build timed out after {}s, killing process group (pgid={pgid})", config.timeout_seconds);
             kill_process_group(pgid).await;
-            drain_pipes(&mut stdout_lines, &mut stderr_lines).await;
+            drain_pipes(&mut stdout_lines, &mut stderr_lines, &mut log_lines, &mut time_output).await;
         }
     }
 
@@ -515,19 +510,55 @@ async fn kill_process_group(pgid: Pid) {
 }
 
 /// Drain remaining pipe data so a killed child doesn't block on a full buffer.
+///
+/// Lines are kept: on a timeout or interrupt kill the final lines are the
+/// most diagnostic output a hung build produced, so they are classified
+/// into `log_lines` / `time_output` exactly like the main read loop rather
+/// than discarded.
 async fn drain_pipes(
     stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stderr: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
+    log_lines: &mut Vec<String>,
+    time_output: &mut String,
 ) {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stdout_done = false;
+        let mut stderr_done = false;
         loop {
+            if stdout_done && stderr_done {
+                break;
+            }
             tokio::select! {
-                r = stdout.next_line() => { if !matches!(r, Ok(Some(_))) { break; } }
-                r = stderr.next_line() => { if !matches!(r, Ok(Some(_))) { break; } }
+                r = stdout.next_line(), if !stdout_done => {
+                    match r {
+                        Ok(Some(line)) => log_lines.push(line),
+                        _ => stdout_done = true,
+                    }
+                }
+                r = stderr.next_line(), if !stderr_done => {
+                    match r {
+                        Ok(Some(line)) => {
+                            classify_stderr_line(line, log_lines, time_output);
+                        }
+                        _ => stderr_done = true,
+                    }
+                }
             }
         }
     })
     .await;
+}
+
+/// Route a stderr line: `/usr/bin/time -v` output goes to `time_output`,
+/// everything else is build log content.  Shared by the main read loop and
+/// the post-kill drain so both classify identically.
+fn classify_stderr_line(line: String, log_lines: &mut Vec<String>, time_output: &mut String) {
+    if is_time_output(&line) {
+        time_output.push_str(&line);
+        time_output.push('\n');
+    } else {
+        log_lines.push(line);
+    }
 }
 
 /// Return `true` if this stderr line looks like `/usr/bin/time -v` output
@@ -775,6 +806,23 @@ mod tests {
         assert!(cmd.starts_with("cat > /tmp/test.sh << 'EOF'"));
         assert!(cmd.contains("echo hello"));
         assert!(cmd.ends_with("chmod +x /tmp/test.sh && /tmp/test.sh"));
+    }
+
+    #[test]
+    fn stderr_line_classification_separates_time_output() {
+        // The drain-after-kill path must keep the same split as the main
+        // read loop: /usr/bin/time lines to metrics, build lines to the log.
+        let mut log_lines = Vec::new();
+        let mut time_output = String::new();
+
+        classify_stderr_line("make[2]: *** [Makefile:79: all] Error 2".into(), &mut log_lines, &mut time_output);
+        classify_stderr_line("\tMaximum resident set size (kbytes): 2048".into(), &mut log_lines, &mut time_output);
+        classify_stderr_line("\tExit status: 137".into(), &mut log_lines, &mut time_output);
+
+        assert_eq!(log_lines, vec!["make[2]: *** [Makefile:79: all] Error 2"]);
+        assert!(time_output.contains("Maximum resident set size (kbytes): 2048"));
+        assert!(time_output.contains("Exit status: 137"));
+        assert_eq!(time_output.lines().count(), 2);
     }
 
     // -- detect_compiler_from_log -------------------------------------------
