@@ -2,8 +2,15 @@
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
+
+/// Wall-clock cap on a single source fetch.  A hung pull-lp-source (network
+/// stall, unresponsive mirror) must not stall the batch forever — sbuild's
+/// own timeout only covers the build phase, not this fetch.  30 minutes
+/// tolerates ~1 GB orig tarballs on slow mirrors.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// A fetched source package, ready for sbuild.
 #[derive(Debug)]
@@ -21,14 +28,24 @@ pub async fn fetch_source(
 ) -> Result<SourcePackage> {
     debug!(package = %package_name, %series, work_dir = %work_dir.display(), "Fetching source");
 
-    let output = Command::new("pull-lp-source")
-        .arg("-d")
+    let mut cmd = Command::new("pull-lp-source");
+    cmd.arg("-d")
         .arg(package_name)
         .arg(series)
         .current_dir(work_dir)
-        .output()
-        .await
-        .context("Failed to execute pull-lp-source")?;
+        // If the timeout below cancels the output() future, drop the child
+        // instead of leaking a live download process.
+        .kill_on_drop(true);
+
+    let output = match tokio::time::timeout(FETCH_TIMEOUT, cmd.output()).await {
+        Ok(result) => result.context("Failed to execute pull-lp-source")?,
+        Err(_) => {
+            bail!(
+                "pull-lp-source for {package_name} in {series} timed out after {} minutes",
+                FETCH_TIMEOUT.as_secs() / 60
+            )
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
