@@ -131,7 +131,13 @@ pub async fn run_batch(
                 Ok(result) => {
                     info!("{progress} {package_name} completed (attempt {attempt}): {}", result.status.as_str());
                     let status = result.status;
-                    store_build_result(pool, batch.id, &result, config).await?;
+                    // A failed DB write must not abort a long-running batch
+                    // (the build itself already succeeded or failed); log it
+                    // and move on to the next package.
+                    if let Err(e) = store_build_result(pool, batch.id, &result, config).await {
+                        error!("{progress} {package_name}: failed to store build result: {e}");
+                        break;
+                    }
 
                     // Retry only if OOM-killed on first attempt with jobs > 1.
                     if status == BuildStatus::OomKilled && attempt == 1 && current_jobs > 1 {
@@ -161,7 +167,9 @@ pub async fn run_batch(
                         memory_limit_mb: None,
                         attempt_number: attempt,
                     };
-                    store_build_result(pool, batch.id, &error_result, config).await?;
+                    if let Err(se) = store_build_result(pool, batch.id, &error_result, config).await {
+                        error!("{progress} {package_name}: failed to store error result: {se}");
+                    }
                     break;
                 }
             }

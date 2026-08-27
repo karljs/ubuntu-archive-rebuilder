@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use rebuilder::{builder, builder::ChrootMode, db, export, fetcher, models::StoreLogs, profile::Profile};
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -444,7 +444,10 @@ async fn main() -> Result<()> {
 }
 
 /// Read package names from a file, one per line.  Blank lines and `#` comments
-/// are skipped.
+/// are skipped.  Duplicate package names are dropped (first occurrence wins):
+/// a duplicate would otherwise violate the batch's
+/// `UNIQUE(batch_id, source_package, attempt_number)` constraint and abort
+/// the whole run.
 ///
 /// Each non-comment line may be either a bare package name or a
 /// tab-delimited (or single-space-delimited) `package<TAB>component` pair
@@ -456,35 +459,40 @@ fn read_package_list(path: &Path) -> Result<Vec<(String, Option<String>)>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read package list: {}", path.display()))?;
 
-    Ok(content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| {
-            // Split on the first tab; fall back to a single space for
-            // hand-edited lists.  Only the first whitespace run is
-            // considered, so package names containing spaces (which don't
-            // exist in the Ubuntu archive) would still mis-parse — but that's
-            // not a real-world concern.
-            if let Some((name, comp)) = line.split_once('\t') {
+    let mut seen = std::collections::HashSet::new();
+    let mut list = Vec::new();
+
+    for line in content.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Split on the first tab, falling back to a single space for
+        // hand-edited lists.  Only the first whitespace run is considered:
+        // archive package names never contain spaces.
+        let (name, comp) = line
+            .split_once('\t')
+            .or_else(|| line.split_once(' '))
+            .map(|(name, comp)| {
                 let name = name.trim();
                 let comp = comp.trim();
                 if name.is_empty() {
-                    return (line.to_string(), None);
+                    (line, "")
+                } else {
+                    (name, comp)
                 }
-                (name.to_string(), if comp.is_empty() { None } else { Some(comp.to_string()) })
-            } else if let Some((name, comp)) = line.split_once(' ') {
-                let name = name.trim();
-                let comp = comp.trim();
-                if name.is_empty() {
-                    return (line.to_string(), None);
-                }
-                (name.to_string(), if comp.is_empty() { None } else { Some(comp.to_string()) })
-            } else {
-                (line.to_string(), None)
-            }
-        })
-        .collect())
+            })
+            .unwrap_or((line, ""));
+        let comp = if comp.is_empty() { None } else { Some(comp.to_string()) };
+
+        if seen.insert(name.to_string()) {
+            list.push((name.to_string(), comp));
+        } else {
+            warn!("Duplicate package '{name}' in list — keeping first occurrence");
+        }
+    }
+
+    Ok(list)
 }
 
 /// Resolve a batch from an optional ID/name string, or fall back to the latest.
@@ -595,5 +603,22 @@ mod tests {
         let path = write_tmp("foo\tmain   \n");
         let list = read_package_list(&path).unwrap();
         assert_eq!(list, vec![("foo".to_string(), Some("main".to_string()))]);
+    }
+
+    #[test]
+    fn read_package_list_dedups_repeated_names() {
+        // Regression: a duplicate name would violate the batch's
+        // UNIQUE(batch_id, source_package, attempt_number) constraint and
+        // abort the entire run mid-batch.  First occurrence wins.
+        let path = write_tmp("foo\tmain\nbar\nfoo\tuniverse\nfoo\nbaz\n");
+        let list = read_package_list(&path).unwrap();
+        assert_eq!(
+            list,
+            vec![
+                ("foo".to_string(), Some("main".to_string())),
+                ("bar".to_string(), None),
+                ("baz".to_string(), None),
+            ]
+        );
     }
 }
