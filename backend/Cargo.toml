@@ -23,9 +23,10 @@ toml = "0.8"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
-# HTTP + decompression (used by fetch-packages subcommand)
+# HTTP + decompression (archive fetches)
 ureq = "2"
 flate2 = "1"
+sha2 = "0.10"
 
 # Utilities
 anyhow = "1"

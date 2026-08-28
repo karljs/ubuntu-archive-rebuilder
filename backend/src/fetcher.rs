@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use std::io::{BufRead, BufReader};
+use std::time::Duration;
 
 /// amd64/i386: primary archive. Everything else: ports.
 /// *.clouds.archive.ubuntu.com is a full mirror of archive.ubuntu.com.
@@ -13,6 +14,40 @@ pub fn default_mirror_for_arch(arch: &str) -> &'static str {
         "amd64" | "i386" => "https://us.clouds.archive.ubuntu.com/ubuntu",
         _ => "https://ports.ubuntu.com/ubuntu-ports",
     }
+}
+
+// ureq ignores proxy env vars; locked-down hosts need them.
+pub fn http_agent() -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(300));
+    if let Some(url) = proxy_from_env() {
+        match ureq::Proxy::new(&url) {
+            Ok(p) => builder = builder.proxy(p),
+            Err(e) => eprintln!("Warning: invalid proxy {url}: {e}"),
+        }
+    }
+    builder.build()
+}
+
+fn proxy_from_env() -> Option<String> {
+    proxy_from_lookup(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+}
+
+fn proxy_from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    for key in [
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "http_proxy",
+        "HTTP_PROXY",
+    ] {
+        if let Some(v) = get(key) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 pub fn fetch_package_list(
@@ -33,7 +68,8 @@ pub fn fetch_package_list(
 
         eprintln!("Fetching {url} ...");
 
-        let response = ureq::get(&url)
+        let response = http_agent()
+            .get(&url)
             .call()
             .with_context(|| format!("HTTP request failed for {url}"))?;
 

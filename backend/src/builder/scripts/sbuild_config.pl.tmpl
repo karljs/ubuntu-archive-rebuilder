@@ -19,4 +19,9 @@ $purge_build_deps = '__PURGE_BUILD_DEPS__';
 $run_lintian = 0;
 $clean_source = 0;
 
+# mmdebstrap defaults to archive.ubuntu.com; use the series' mirror so
+# locked-down hosts can bootstrap chroots. The key is matched against the
+# distribution string; extra positionals after the target become the mirror.
+$unshare_mmdebstrap_extra_args = [ '__DIST__' => [ '__MIRROR__' ] ];
+
 1;

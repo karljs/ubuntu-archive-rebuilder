@@ -6,7 +6,7 @@ mod source;
 mod time_parser;
 
 pub use sbuild::{run_sbuild, ChrootMode, SbuildConfig};
-pub use source::{fetch_source, SourcePackage};
+pub use source::{fetch_source, SourceIndex, SourcePackage};
 pub use time_parser::parse_time_output;
 
 use crate::analyzer::scan_log;
@@ -19,6 +19,7 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use std::path::PathBuf;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -81,6 +82,16 @@ pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid,
     }
 
     let total = config.packages.len();
+
+    let source_index = {
+        let series = config.profile.target.series.clone();
+        let arch = config.arch.clone();
+        let index = task::spawn_blocking(move || SourceIndex::load(&series, &arch))
+            .await
+            .context("source index load task panicked")??;
+        std::sync::Arc::new(index)
+    };
+
     for (idx, (package_name, component)) in config.packages.iter().enumerate() {
         if cancel_token.is_cancelled() {
             info!("Batch cancelled, aborting remaining builds");
@@ -95,6 +106,7 @@ pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid,
 
         loop {
             match build_package(
+                source_index.clone(),
                 package_name,
                 component.as_deref(),
                 config,
@@ -168,6 +180,7 @@ pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid,
 }
 
 async fn build_package(
+    source_index: std::sync::Arc<SourceIndex>,
     package_name: &str,
     component: Option<&str>,
     config: &BuildConfig,
@@ -188,7 +201,7 @@ async fn build_package(
 
     let series = &config.profile.target.series;
     info!(package = %package_name, "Fetching source");
-    let source = fetch_source(package_name, series, temp_dir.path()).await?;
+    let source = fetch_source(source_index, package_name, temp_dir.path()).await?;
 
     info!(package = %package_name, version = %source.version, "Running sbuild");
     let sbuild_config = SbuildConfig {

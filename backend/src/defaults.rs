@@ -5,7 +5,6 @@ use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
-use std::time::Duration;
 
 // One compressed Packages index per (series, component), shared across
 // lookups within a run.
@@ -52,9 +51,7 @@ pub fn default_compiler_version(
 }
 
 fn fetch_index(url: &str) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(300))
-        .build();
+    let agent = crate::fetcher::http_agent();
     let resp = agent
         .get(url)
         .call()

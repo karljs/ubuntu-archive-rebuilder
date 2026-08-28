@@ -254,6 +254,8 @@ fn build_command(
         config.run_tests,
         &config.build_env,
         config.chroot_mode,
+        &config.series,
+        &config.arch,
     )?;
 
     let mut sbuild_args: Vec<String> = vec![
@@ -382,6 +384,8 @@ fn generate_sbuild_config(
     run_tests: bool,
     build_env: &[(String, String)],
     chroot_mode: ChrootMode,
+    series: &str,
+    arch: &str,
 ) -> Result<tempfile::NamedTempFile> {
     let nocheck = if run_tests { "" } else { " nocheck" };
 
@@ -402,7 +406,9 @@ fn generate_sbuild_config(
 
     let config = SBUILD_CONFIG_TEMPLATE
         .replace("__ENV_BLOCK__", &env_block)
-        .replace("__PURGE_BUILD_DEPS__", purge_build_deps);
+        .replace("__PURGE_BUILD_DEPS__", purge_build_deps)
+        .replace("__DIST__", series)
+        .replace("__MIRROR__", crate::fetcher::default_mirror_for_arch(arch));
 
     let mut file = tempfile::Builder::new()
         .prefix("rebuild-sbuild-")
@@ -837,7 +843,8 @@ mod tests {
 
     #[test]
     fn sbuild_config_unshare_purges_deps_always() {
-        let file = generate_sbuild_config(4, false, &[], ChrootMode::Unshare).unwrap();
+        let file =
+            generate_sbuild_config(4, false, &[], ChrootMode::Unshare, "noble", "amd64").unwrap();
         let config = std::fs::read_to_string(file.path()).unwrap();
         assert!(
             config.contains("$purge_build_deps = 'always';"),
@@ -848,7 +855,8 @@ mod tests {
 
     #[test]
     fn sbuild_config_schroot_purges_deps_never() {
-        let file = generate_sbuild_config(4, false, &[], ChrootMode::Schroot).unwrap();
+        let file =
+            generate_sbuild_config(4, false, &[], ChrootMode::Schroot, "noble", "amd64").unwrap();
         let config = std::fs::read_to_string(file.path()).unwrap();
         assert!(
             config.contains("$purge_build_deps = 'never';"),
@@ -860,7 +868,7 @@ mod tests {
     #[test]
     fn sbuild_config_no_placeholders_remain() {
         for mode in [ChrootMode::Unshare, ChrootMode::Schroot] {
-            let file = generate_sbuild_config(4, true, &[], mode).unwrap();
+            let file = generate_sbuild_config(4, true, &[], mode, "noble", "amd64").unwrap();
             let config = std::fs::read_to_string(file.path()).unwrap();
             assert!(
                 !config.contains("__ENV_BLOCK__"),
