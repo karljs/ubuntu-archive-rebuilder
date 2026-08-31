@@ -24,4 +24,7 @@ $clean_source = 0;
 # distribution string; extra positionals after the target become the mirror.
 $unshare_mmdebstrap_extra_args = [ '__DIST__' => [ '__MIRROR__' ] ];
 
+# Without this sbuild re-runs mmdebstrap for every single build (~40s each).
+$unshare_mmdebstrap_keep_tarball = 1;
+
 1;

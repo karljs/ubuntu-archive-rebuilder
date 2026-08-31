@@ -94,7 +94,7 @@ pub struct SbuildResult {
 /// with timeout(1) orphaned chroot processes in earlier iterations.
 pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     let build_id = Uuid::new_v4();
-    let (mut cmd, _config_file, scope_name) = build_command(config, build_id)?;
+    let (mut cmd, _config_file, metrics_file, scope_name) = build_command(config, build_id)?;
 
     debug!("Spawning: {:?}", cmd);
 
@@ -108,7 +108,6 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
     let mut stderr_lines = BufReader::new(stderr).lines();
 
     let mut log_lines: Vec<String> = Vec::new();
-    let mut time_output = String::new();
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut timed_out = false;
@@ -140,7 +139,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
                         Ok(Some(line)) => {
                             if config.verbose { eprintln!("{line}"); }
                             trace!(stderr = true, "{line}");
-                            classify_stderr_line(line, &mut log_lines, &mut time_output);
+                            log_lines.push(line);
                         }
                         Ok(None) => stderr_done = true,
                         Err(e) => { debug!("stderr read error: {e}"); stderr_done = true; }
@@ -157,13 +156,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
         Ok(Err(e)) => {
             info!("Killing process group (pgid={pgid}) due to: {e}");
             kill_process_group(pgid).await;
-            drain_pipes(
-                &mut stdout_lines,
-                &mut stderr_lines,
-                &mut log_lines,
-                &mut time_output,
-            )
-            .await;
+            drain_pipes(&mut stdout_lines, &mut stderr_lines, &mut log_lines).await;
             let _ = child.wait().await;
             return Err(e);
         }
@@ -174,13 +167,7 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
                 config.timeout_seconds
             );
             kill_process_group(pgid).await;
-            drain_pipes(
-                &mut stdout_lines,
-                &mut stderr_lines,
-                &mut log_lines,
-                &mut time_output,
-            )
-            .await;
+            drain_pipes(&mut stdout_lines, &mut stderr_lines, &mut log_lines).await;
         }
     }
 
@@ -198,6 +185,14 @@ pub async fn run_sbuild(config: &SbuildConfig) -> Result<SbuildResult> {
 
     let exit_status = child.wait().await.context("Failed to wait for sbuild")?;
     let log = log_lines.join("\n");
+    // time wrote its banner and metrics to the file, not stderr; unknown
+    // lines in it (the banner) are ignored by the parser.
+    let time_output = std::fs::read_to_string(metrics_file.path()).with_context(|| {
+        format!(
+            "Failed to read time metrics {}",
+            metrics_file.path().display()
+        )
+    })?;
     let metrics = parse_time_output(&time_output);
     let compiler_detected = detect_compiler_from_log(&log, config.compiler_type);
 
@@ -247,7 +242,12 @@ fn http_proxy_for_chroot() -> String {
 fn build_command(
     config: &SbuildConfig,
     build_id: Uuid,
-) -> Result<(Command, tempfile::NamedTempFile, Option<String>)> {
+) -> Result<(
+    Command,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+    Option<String>,
+)> {
     let dsc_dir = config.dsc_path.parent().context("Invalid .dsc path")?;
 
     let sbuild_config_file = generate_sbuild_config(
@@ -258,6 +258,15 @@ fn build_command(
         &config.series,
         &config.arch,
     )?;
+
+    // time's banner ("Command being timed: <full multi-line command>")
+    // must never reach the captured stderr; -o routes it here instead.
+    let metrics_file = tempfile::Builder::new()
+        .prefix("rebuild-time-")
+        .suffix(".txt")
+        .tempfile()
+        .context("Failed to create time metrics tempfile")?;
+    let time_args = ["-v", "-o"];
 
     let mut sbuild_args: Vec<String> = vec![
         "--verbose".into(),
@@ -336,7 +345,8 @@ fn build_command(
             .arg(format!("--property=MemoryMax={limit_bytes}"))
             .arg("--")
             .arg("/usr/bin/time")
-            .arg("-v")
+            .args(time_args)
+            .arg(metrics_file.path())
             .arg("sbuild");
         for a in &sbuild_args {
             cmd.arg(a);
@@ -344,7 +354,7 @@ fn build_command(
         cmd
     } else {
         let mut cmd = Command::new("/usr/bin/time");
-        cmd.arg("-v").arg("sbuild");
+        cmd.args(time_args).arg(metrics_file.path()).arg("sbuild");
         for a in &sbuild_args {
             cmd.arg(a);
         }
@@ -372,7 +382,7 @@ fn build_command(
         });
     }
 
-    Ok((cmd, sbuild_config_file, scope_name))
+    Ok((cmd, sbuild_config_file, metrics_file, scope_name))
 }
 
 // sbuild external commands receive multi-line scripts via this heredoc form.
@@ -447,7 +457,6 @@ async fn drain_pipes(
     stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stderr: &mut tokio::io::Lines<BufReader<tokio::process::ChildStderr>>,
     log_lines: &mut Vec<String>,
-    time_output: &mut String,
 ) {
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stdout_done = false;
@@ -465,9 +474,7 @@ async fn drain_pipes(
                 }
                 r = stderr.next_line(), if !stderr_done => {
                     match r {
-                        Ok(Some(line)) => {
-                            classify_stderr_line(line, log_lines, time_output);
-                        }
+                        Ok(Some(line)) => log_lines.push(line),
                         _ => stderr_done = true,
                     }
                 }
@@ -475,29 +482,6 @@ async fn drain_pipes(
         }
     })
     .await;
-}
-
-// /usr/bin/time -v output goes to time_output, the rest to the build log.
-fn classify_stderr_line(line: String, log_lines: &mut Vec<String>, time_output: &mut String) {
-    if is_time_output(&line) {
-        time_output.push_str(&line);
-        time_output.push('\n');
-    } else {
-        log_lines.push(line);
-    }
-}
-
-fn is_time_output(line: &str) -> bool {
-    line.contains("time (seconds):")
-        || line.contains("Maximum resident set size")
-        || line.contains("Exit status:")
-        || line.contains("Elapsed (wall clock)")
-        || line.contains("Command being timed")
-        || line.contains("Percent of CPU")
-        || line.contains("Major (requiring I/O) page faults")
-        || line.contains("Minor (reclaiming a frame) page faults")
-        || line.contains("Voluntary context switches")
-        || line.contains("Involuntary context switches")
 }
 
 // sbuild echoes the full script source before executing it, so markers
@@ -717,33 +701,6 @@ mod tests {
         assert!(cmd.starts_with("cat > /tmp/test.sh << 'EOF'"));
         assert!(cmd.contains("echo hello"));
         assert!(cmd.ends_with("chmod +x /tmp/test.sh && /tmp/test.sh"));
-    }
-
-    #[test]
-    fn stderr_line_classification_separates_time_output() {
-        let mut log_lines = Vec::new();
-        let mut time_output = String::new();
-
-        classify_stderr_line(
-            "make[2]: *** [Makefile:79: all] Error 2".into(),
-            &mut log_lines,
-            &mut time_output,
-        );
-        classify_stderr_line(
-            "\tMaximum resident set size (kbytes): 2048".into(),
-            &mut log_lines,
-            &mut time_output,
-        );
-        classify_stderr_line(
-            "\tExit status: 137".into(),
-            &mut log_lines,
-            &mut time_output,
-        );
-
-        assert_eq!(log_lines, vec!["make[2]: *** [Makefile:79: all] Error 2"]);
-        assert!(time_output.contains("Maximum resident set size (kbytes): 2048"));
-        assert!(time_output.contains("Exit status: 137"));
-        assert_eq!(time_output.lines().count(), 2);
     }
 
     #[test]
