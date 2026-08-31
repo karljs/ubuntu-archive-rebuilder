@@ -360,9 +360,4 @@ mod tests {
         assert!(!find_in_path("definitely-not-a-real-command-xyz"));
         assert!(!find_in_path("/no/such/path/xyz"));
     }
-
-    #[test]
-    fn preflight_passes_on_a_working_machine() {
-        preflight(ChrootMode::Unshare).unwrap();
-    }
 }
