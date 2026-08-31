@@ -8,7 +8,8 @@ For each package in a user-defined batch, the builder will:
 
 1. Fetch the source from the Ubuntu archive via `pull-lp-source`.
 2. Run `sbuild --chroot-mode=unshare` with the profile's compiler and flags.
-3. For `clang` profiles, install the target version inside the build
+3. Configure apt inside the chroot with `REBUILD_HTTP_PROXY` (if set), and
+   for `clang` profiles install the target version inside the build
    environment and replace `/usr/bin/gcc`, `g++`, `cc`, `c++` and all
    versioned or architecture-prefixed variants (`gcc-15`,
    `x86_64-linux-gnu-gcc`, ...) with wrapper scripts that exec `clang`.

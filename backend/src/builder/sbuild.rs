@@ -1,7 +1,8 @@
 //! sbuild invocation and process management. Each build runs under
 //! `/usr/bin/time -v` in its own process group (setpgid/killpg) so timeouts
 //! and Ctrl+C kill the whole tree. Clang substitution is injected via sbuild
-//! hooks: chroot-setup installs clang, starting-build wraps gcc to clang.
+//! hooks: chroot-setup configures the apt proxy (all profiles) and installs
+//! clang (clang profiles); starting-build wraps gcc to clang.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -283,22 +284,29 @@ fn build_command(
         }
     }
 
+    // Every profile gets the apt proxy config in the chroot; clang
+    // profiles additionally install the target version there.
+    let proxy = http_proxy_for_chroot();
+    let clang_version = match config.compiler_type {
+        CompilerType::Clang => config.compiler_version.as_str(),
+        CompilerType::Gcc => "",
+    };
+    let setup_cmd = wrap_in_heredoc(
+        "chroot-setup.sh",
+        "REBUILD_CHROOT_SETUP_EOF",
+        &CHROOT_SETUP_SCRIPT
+            .replace("__CLANG_VERSION__", clang_version)
+            .replace("__HTTP_PROXY__", &proxy),
+    );
+    sbuild_args.push(format!("--chroot-setup-commands={setup_cmd}"));
+
     match config.compiler_type {
         CompilerType::Clang => {
-            let proxy = http_proxy_for_chroot();
-            let setup_cmd = wrap_in_heredoc(
-                "clang-install.sh",
-                "CLANG_INSTALL_EOF",
-                &CHROOT_SETUP_SCRIPT
-                    .replace("__CLANG_VERSION__", &config.compiler_version)
-                    .replace("__HTTP_PROXY__", &proxy),
-            );
             let starting_cmd = wrap_in_heredoc(
                 "clang-wrapper-setup.sh",
                 "CLANG_WRAPPER_EOF",
                 &STARTING_BUILD_SCRIPT.replace("__CLANG_VERSION__", &config.compiler_version),
             );
-            sbuild_args.push(format!("--chroot-setup-commands={setup_cmd}"));
             sbuild_args.push(format!("--starting-build-commands={starting_cmd}"));
         }
         CompilerType::Gcc => {
@@ -586,7 +594,23 @@ mod tests {
         assert!(script.contains(r#"CLANG_VERSION="19""#));
         assert!(!script.contains("__CLANG_VERSION__"));
         assert!(!script.contains("__HTTP_PROXY__"));
+        // Both guards exist; with empty proxy the proxy branch is dead.
         assert!(script.contains("if [ -n \"\" ]; then"));
+    }
+
+    // Regression: gcc profiles must get a chroot-setup script too (apt
+    // proxy); an empty version leaves the clang-install branch dead instead
+    // of running apt-get with an empty package name.
+    #[test]
+    fn chroot_setup_empty_version_skips_clang_install() {
+        let script = CHROOT_SETUP_SCRIPT
+            .replace("__CLANG_VERSION__", "")
+            .replace("__HTTP_PROXY__", "http://proxy.example:3128");
+        assert!(script.contains(r#"CLANG_VERSION="""#));
+        // The clang install stays inside the dead branch.
+        let guard = script.find("if [ -n \"\" ]; then").unwrap();
+        let install = script.find("apt-get install").unwrap();
+        assert!(guard < install);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::analyzer::scan_log;
 use crate::db::{self, BatchStats};
 use crate::models::{BuildResult, BuildStatus, BuilderBackend, StoreLogs};
 use crate::profile::Profile;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression};
 use sqlx::SqlitePool;
 use std::io::Write;
@@ -40,8 +40,34 @@ pub struct BuildConfig {
     pub chroot_mode: ChrootMode,
 }
 
+fn find_in_path(name: &str) -> bool {
+    if name.contains('/') {
+        return PathBuf::from(name).exists();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+// Without this a missing binary fails 2347 times as opaque exit-127 junk
+// instead of once with an actionable message.
+fn preflight(chroot_mode: ChrootMode) -> Result<()> {
+    if !find_in_path("sbuild") {
+        bail!("sbuild not found in PATH; install it: sudo apt install sbuild");
+    }
+    if !find_in_path("/usr/bin/time") {
+        bail!("/usr/bin/time not found; install it: sudo apt install time");
+    }
+    if chroot_mode == ChrootMode::Unshare && !find_in_path("mmdebstrap") {
+        bail!("mmdebstrap not found (sbuild unshare mode needs it): sudo apt install mmdebstrap");
+    }
+    Ok(())
+}
+
 /// Ctrl+C cancels the current build and skips the rest.
 pub async fn run_batch(pool: &SqlitePool, config: &BuildConfig) -> Result<(Uuid, BatchStats)> {
+    preflight(config.chroot_mode)?;
+
     let batch =
         db::create_batch(pool, &config.profile, BuilderBackend::Sbuild, &config.arch).await?;
 
@@ -317,4 +343,26 @@ fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {
     encoder
         .finish()
         .context("Failed to finish gzip compression")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_in_path_finds_real_binary() {
+        assert!(find_in_path("sh"));
+        assert!(find_in_path("/usr/bin/time"));
+    }
+
+    #[test]
+    fn find_in_path_rejects_missing() {
+        assert!(!find_in_path("definitely-not-a-real-command-xyz"));
+        assert!(!find_in_path("/no/such/path/xyz"));
+    }
+
+    #[test]
+    fn preflight_passes_on_a_working_machine() {
+        preflight(ChrootMode::Unshare).unwrap();
+    }
 }

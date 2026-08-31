@@ -56,7 +56,8 @@ fi
 echo "Using: $DSC"
 echo ""
 
-CHROOT_SETUP_SCRIPT=$(sed "s/__CLANG_VERSION__/$CLANG_VERSION/g" \
+CHROOT_SETUP_SCRIPT=$(sed -e "s/__CLANG_VERSION__/$CLANG_VERSION/g" \
+    -e "s/__HTTP_PROXY__/${REBUILD_HTTP_PROXY:-}/g" \
     "$PIPELINE_SCRIPTS/chroot_setup.sh")
 
 STARTING_BUILD_SCRIPT=$(sed "s/__CLANG_VERSION__/$CLANG_VERSION/g" \
