@@ -133,20 +133,6 @@ impl Profile {
         Ok(())
     }
 
-    /// unshare mode debootstraps the series.
-    pub fn validate_series_available(&self) -> Result<()> {
-        let script_path = format!("/usr/share/debootstrap/scripts/{}", self.target.series);
-        if !Path::new(&script_path).exists() {
-            bail!(
-                "Series '{}' is not available for building: {} does not exist. \
-                 Install debootstrap or check the series name.",
-                self.target.series,
-                script_path
-            );
-        }
-        Ok(())
-    }
-
     pub fn build_env_vars(&self) -> Vec<(String, String)> {
         use std::collections::BTreeMap;
         let mut map: BTreeMap<String, Vec<&str>> = BTreeMap::new();

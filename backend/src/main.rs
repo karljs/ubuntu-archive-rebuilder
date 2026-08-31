@@ -201,10 +201,6 @@ async fn main() -> Result<()> {
         } => {
             let profile = Profile::load(&profile_path)?;
 
-            if shared.chroot_mode == ChrootMode::Unshare {
-                profile.validate_series_available()?;
-            }
-
             let package_list = read_package_list(&packages)?;
             if package_list.is_empty() {
                 bail!("No packages to build");
@@ -620,9 +616,6 @@ async fn run_defaults(pool: &sqlx::SqlitePool, verbose: bool, args: RunDefaultsA
             profile.name,
             pkgs.len()
         );
-        if shared.chroot_mode == ChrootMode::Unshare {
-            profile.validate_series_available()?;
-        }
         let config = builder::BuildConfig {
             profile: profile.clone(),
             packages: pkgs,
