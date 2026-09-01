@@ -19,10 +19,18 @@ $purge_build_deps = '__PURGE_BUILD_DEPS__';
 $run_lintian = 0;
 $clean_source = 0;
 
-# mmdebstrap defaults to archive.ubuntu.com; use the series' mirror so
-# locked-down hosts can bootstrap chroots. The key is matched against the
-# distribution string; extra positionals after the target become the mirror.
-$unshare_mmdebstrap_extra_args = [ '__DIST__' => [ '__MIRROR__' ] ];
+# mmdebstrap defaults to archive.ubuntu.com on https with main-only sources.
+# Pass full deb lines instead of a bare mirror: main+universe (build-deps of
+# main packages can live in universe, e.g. texinfo) across all three pockets,
+# matching a real Ubuntu buildd. Key is matched against the distribution
+# string; each deb line becomes one sources.list entry verbatim.
+$unshare_mmdebstrap_extra_args = [
+    '__DIST__' => [
+        'deb __MIRROR__ __DIST__ main universe',
+        'deb __MIRROR__ __DIST__-updates main universe',
+        'deb __MIRROR__ __DIST__-security main universe',
+    ]
+];
 
 # Without this sbuild re-runs mmdebstrap for every single build (~40s each).
 $unshare_mmdebstrap_keep_tarball = 1;
