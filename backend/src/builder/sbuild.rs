@@ -426,7 +426,13 @@ fn generate_sbuild_config(
         .replace("__ENV_BLOCK__", &env_block)
         .replace("__PURGE_BUILD_DEPS__", purge_build_deps)
         .replace("__DIST__", series)
-        .replace("__MIRROR__", crate::fetcher::default_mirror_for_arch(arch));
+        // http, not https: the proxy may MITM TLS (internal CA) and buildd
+        // chroots ship without ca-certificates, so https apt sources fail
+        // inside the chroot.
+        .replace(
+            "__MIRROR__",
+            &crate::fetcher::default_mirror_for_arch(arch).replace("https://", "http://"),
+        );
 
     let mut file = tempfile::Builder::new()
         .prefix("rebuild-sbuild-")
@@ -858,6 +864,26 @@ mod tests {
             assert!(
                 !config.contains("__PURGE_BUILD_DEPS__"),
                 "mode {mode:?}: __PURGE_BUILD_DEPS__ remains"
+            );
+        }
+    }
+
+    // Regression: the chroot mirror must be http. https fails inside the
+    // chroot (proxy MITM with an internal CA + no ca-certificates in the
+    // builld variant).
+    #[test]
+    fn sbuild_config_chroot_mirror_is_http() {
+        for (series, arch) in [("noble", "amd64"), ("noble", "arm64")] {
+            let file =
+                generate_sbuild_config(4, false, &[], ChrootMode::Unshare, series, arch).unwrap();
+            let config = std::fs::read_to_string(file.path()).unwrap();
+            assert!(
+                config.contains("http://"),
+                "{series}/{arch}: no http mirror in config:\n{config}"
+            );
+            assert!(
+                !config.contains("https://"),
+                "{series}/{arch}: https mirror leaked into chroot config:\n{config}"
             );
         }
     }
